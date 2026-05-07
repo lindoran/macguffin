@@ -182,11 +182,7 @@ static int s_attr = VGA_ATTR_DEFAULT;
 static int s_col = 0, s_row = 0;
 
 static void vio_gotoxy(int col, int row) {
-    union REGS r;
     s_col = col; s_row = row;
-    r.h.ah = 0x02; r.h.bh = 0;
-    r.h.dh = (unsigned char)row; r.h.dl = (unsigned char)col;
-    int86(0x10, &r, &r);
 }
 
 static void vio_setattr(int attr) { s_attr = attr; }
@@ -197,7 +193,6 @@ static void vio_putch(unsigned char ch) {
     vga[off] = ch;
     vga[off+1] = (unsigned char)s_attr;
     if (s_col < 79) s_col++;
-    vio_gotoxy(s_col, s_row);
 }
 
 static void vio_puts(const char *s) {
@@ -242,7 +237,12 @@ static void vio_uint(unsigned int n, int width) {
     while (i > 0) vio_putch((unsigned char)buf[--i]);
 }
 
-static void vio_show_cursor(void) { vio_gotoxy(s_col, s_row); }
+static void vio_show_cursor(void) {
+    union REGS r;
+    r.h.ah = 0x02; r.h.bh = 0;
+    r.h.dh = (unsigned char)s_row; r.h.dl = (unsigned char)s_col;
+    int86(0x10, &r, &r);
+}
 static void vio_flush(void) { }
 static void vio_init(void *vt) { (void)vt; }
 static void vio_fini(void) { }
