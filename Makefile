@@ -13,7 +13,7 @@
 #    DOS:  ia16-elf-gcc + libi86
 # ---------------------------------------------------------------
 
-PDCDIR  = PDCursesMod
+PDCDIR  = deps/PDCursesMod
 PDCINC  = -I$(PDCDIR)
 CSTD    = -std=c89
 WARN    = -Wall -Wextra -pedantic

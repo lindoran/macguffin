@@ -1,23 +1,17 @@
 /*
  * editor.c  --  minimal CP437 text editor via PDCursesMod/SDL2
  *
- * Keybindings:
- *   Ctrl-S   save (no-op if [new] -- future: command bar)
- *   Ctrl-N   new file
- *   Ctrl-Q   quit
- *   Insert   toggle INS/OVR
- *   Arrows, Home, End, PgUp, PgDn, Backspace, Delete, Enter
- *
- * Build: see Makefile
+ * Deterministic, fixed-geometry 80x24 text mode.
+ * Dirty-row rendering, no shadow buffer, no memcmp.
+ * SDL2 window locked to fixed size via PDCursesMod.
  */
 
 #include <curses.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/*  Portability                                                         */
+/*  Portability                                                        */
 /* ------------------------------------------------------------------ */
 #define CTRL(x)  ((x) & 0x1f)
 
@@ -26,7 +20,7 @@
 #endif
 
 /* ------------------------------------------------------------------ */
-/*  Line buffer                                                         */
+/*  Line buffer                                                        */
 /* ------------------------------------------------------------------ */
 #ifdef __ia16__
 #  define MAX_LINES  2048
@@ -38,13 +32,12 @@
 #define LINE_INIT  128
 
 /* ------------------------------------------------------------------ */
-/*  PCL3 page geometry                                                  */
-/*  Standard US Letter at 6lpi / 10cpi                                 */
+/*  PCL3 page geometry                                                 */
 /* ------------------------------------------------------------------ */
-#define PCL_LPI    6    /* lines per inch                              */
-#define PCL_CPI    10   /* characters per inch                         */
-#define PCL_LPP    66   /* lines per page  (11in * 6lpi)               */
-#define PCL_CPL    80   /* characters per line (8in printable * 10cpi) */
+#define PCL_LPI    6
+#define PCL_CPI    10
+#define PCL_LPP    66
+#define PCL_CPL    80
 
 typedef struct {
     char *buf;
@@ -53,8 +46,16 @@ typedef struct {
 } Line;
 
 static Line lines[MAX_LINES];
-static int  nlines   = 1;
+static int  nlines = 1;
 
+
+
+
+
+
+/* ------------------------------------------------------------------ */
+/*  Line helpers                                                       */
+/* ------------------------------------------------------------------ */
 static void line_init(Line *l)
 {
     l->cap = LINE_INIT;
@@ -74,7 +75,7 @@ static void line_grow(Line *l, int need)
 {
     while (l->cap <= need + 1) {
         l->cap *= 2;
-        l->buf  = (char *)realloc(l->buf, (size_t)l->cap);
+        l->buf = (char *)realloc(l->buf, (size_t)l->cap);
     }
 }
 
@@ -93,7 +94,6 @@ static void line_del(Line *l, int pos)
     l->len--;
 }
 
-/* Split line[row] at pos; new line inserted after row. */
 static void split_line(int row, int pos)
 {
     int i, tail;
@@ -113,7 +113,6 @@ static void split_line(int row, int pos)
     lines[row].len = pos;
 }
 
-/* Join line[row+1] onto line[row]. */
 static void join_lines(int row)
 {
     int i, old_len;
@@ -133,20 +132,25 @@ static void join_lines(int row)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Editor state                                                        */
+/*  Editor state                                                       */
 /* ------------------------------------------------------------------ */
 static int  cur_row  = 0;
 static int  cur_col  = 0;
-static int  top_row  = 0;   /* first visible row */
-static int  ins_mode = 1;   /* 1=insert, 0=overwrite */
+static int  top_row  = 0;
+static int  ins_mode = 1;
 static int  modified = 0;
 static int  running  = 1;
 static char fname[512] = "[new]";
+static int  fname_len   = 5;   /* strlen("[new]") */
 
-#define EDIT_ROWS  (LINES - 1)   /* last row is status bar */
+static unsigned char line_dirty[MAX_LINES];
+static int status_dirty  = 1;
+static int content_dirty = 1;
+
+#define EDIT_ROWS (LINES - 1)
 
 /* ------------------------------------------------------------------ */
-/*  Clamp cursor column to line length                                  */
+/*  Cursor clamp + visibility                                          */
 /* ------------------------------------------------------------------ */
 static void clamp_col(void)
 {
@@ -154,81 +158,171 @@ static void clamp_col(void)
         cur_col = lines[cur_row].len;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Drawing                                                             */
-/* ------------------------------------------------------------------ */
-static void draw_status(void)
+static void ensure_visible(void)
 {
-    char bar[256];
-    int  page = cur_row / PCL_LPP + 1;
-    int  line = cur_row % PCL_LPP + 1;
+    int old_top = top_row;
 
-    sprintf(bar, " %-20s p.%-3d l.%-4d c.%-4d %dcpi  %-3s",
-            fname,
-            page,
-            line,
-            cur_col + 1,
-            PCL_CPI,
-            ins_mode ? "INS" : "OVR");
-
-    move(LINES - 1, 0);
-    attron(A_REVERSE);
-    clrtoeol();
-    addstr(bar);
-    attroff(A_REVERSE);
-}
-
-static void draw_screen(void)
-{
-    int r, c;
-
-    /* scroll so cursor is visible */
     if (cur_row < top_row)
         top_row = cur_row;
     if (cur_row >= top_row + EDIT_ROWS)
         top_row = cur_row - EDIT_ROWS + 1;
 
-    for (r = 0; r < EDIT_ROWS; r++) {
-        int lr = r + top_row;
-        move(r, 0);
-        clrtoeol();
-        if (lr < nlines) {
-            for (c = 0; c < lines[lr].len && c < COLS; c++)
-                addch((unsigned char)lines[lr].buf[c]);
+    if (top_row < 0) top_row = 0;
+    if (top_row > nlines - 1) top_row = nlines - 1;
+
+    if (top_row != old_top) {
+        int r;
+        for (r = 0; r < EDIT_ROWS; r++) {
+            int lr = top_row + r;
+            if (lr >= 0 && lr < nlines)
+                line_dirty[lr] = 1;
         }
+        content_dirty = 1;
+    }
+}
+ 
+/* ------------------------------------------------------------------   
+  Drawing                                                               
+    we unrolled this because it was a stdio funciton that was basically 
+    a tiny interperater that was firing nearly every frame with a status bar
+    update (basically every frame with typing)                           
+   ------------------------------------------------------------------   */
+static void draw_status(void)
+{
+    char bar[80];
+    int pos = 0;
+    int page = cur_row / PCL_LPP + 1;
+    int line = cur_row % PCL_LPP + 1;
+    int col  = cur_col + 1;
+    int i; /*for index*/
+
+    /* fname padded/truncated to 20 chars */
+    for (i = 0; i < 20; i++)
+        bar[pos++] = (i < fname_len) ? fname[i] : ' ';
+
+    bar[pos++] = ' ';
+
+    /* p.xxx */
+    bar[pos++] = 'p';
+    bar[pos++] = '.';
+    bar[pos++] = '0' + (page / 100) % 10;
+    bar[pos++] = '0' + (page / 10)  % 10;
+    bar[pos++] = '0' + (page % 10);
+    bar[pos++] = ' ';
+
+    /* l.xxxx */
+    bar[pos++] = 'l';
+    bar[pos++] = '.';
+    bar[pos++] = '0' + (line / 1000) % 10;
+    bar[pos++] = '0' + (line / 100)  % 10;
+    bar[pos++] = '0' + (line / 10)   % 10;
+    bar[pos++] = '0' + (line % 10);
+    bar[pos++] = ' ';
+
+    /* c.xxxx */
+    bar[pos++] = 'c';
+    bar[pos++] = '.';
+    bar[pos++] = '0' + (col / 1000) % 10;
+    bar[pos++] = '0' + (col / 100)  % 10;
+    bar[pos++] = '0' + (col / 10)   % 10;
+    bar[pos++] = '0' + (col % 10);
+    bar[pos++] = ' ';
+
+    /* 10cpi literal */
+    bar[pos++] = '1';
+    bar[pos++] = '0';
+    bar[pos++] = 'c';
+    bar[pos++] = 'p';
+    bar[pos++] = 'i';
+    bar[pos++] = ' ';
+
+    /* INS / OVR */
+    bar[pos++] = ins_mode ? 'I' : 'O';
+    bar[pos++] = ins_mode ? 'N' : 'V';
+    bar[pos++] = ins_mode ? 'S' : 'R';
+
+    /* pad rest */
+    while (pos < 80)
+        bar[pos++] = ' ';
+
+    move(LINES - 1, 0);
+    attron(A_REVERSE);
+    addnstr(bar, 80);
+    attroff(A_REVERSE);
+
+    status_dirty = 0;
+}
+
+
+
+static void draw_content(void)
+{
+    int r;
+    char *txt;
+    int len;
+
+    for (r = 0; r < EDIT_ROWS; r++) {
+        int lr = top_row + r;
+        if (lr < 0 || lr >= nlines)
+            continue;
+        if (!line_dirty[lr])
+            continue;
+
+        txt = lines[lr].buf;
+        len = lines[lr].len;
+        if (len > COLS) len = COLS;
+
+        move(r, 0);
+        if (len > 0)
+            addnstr(txt, len);
+
+        if (len < COLS) {
+            int pad = COLS - len;
+            while (pad--) addch(' ');
+        }
+
+        line_dirty[lr] = 0;
     }
 
-    draw_status();
-    move(cur_row - top_row, cur_col);
-    refresh();
+    content_dirty = 0;
 }
 
 /* ------------------------------------------------------------------ */
-/*  File I/O                                                            */
+/*  File I/O                                                           */
 /* ------------------------------------------------------------------ */
 static void reset_editor(void)
 {
     int i;
-    for (i = 0; i < nlines; i++) line_free(&lines[i]);
-    nlines   = 1;
-    cur_row  = cur_col = top_row = 0;
+    for (i = 0; i < nlines; i++)
+        line_free(&lines[i]);
+
+    nlines = 1;
+    cur_row = cur_col = top_row = 0;
     modified = 0;
+
     line_init(&lines[0]);
+
+    for (i = 0; i < MAX_LINES; i++)
+        line_dirty[i] = 1;
+
+    status_dirty  = 1;
+    content_dirty = 1;
 }
 
 static void do_new(void)
 {
     reset_editor();
     strcpy(fname, "[new]");
+    fname_len = 5;
 }
 
 static int do_save(void)
 {
     FILE *f;
-    int   i;
+    int i;
 
     if (strcmp(fname, "[new]") == 0)
-        return 0;   /* need filename -- command bar (future) */
+        return 0;
 
     f = fopen(fname, "wb");
     if (!f) return -1;
@@ -238,15 +332,17 @@ static int do_save(void)
         if (i < nlines - 1) fputc('\n', f);
     }
     fclose(f);
+
     modified = 0;
+    status_dirty = 1;
     return 0;
 }
 
 static void do_load(const char *path)
 {
     FILE *f;
-    char  buf[LOAD_BUF];
-    int   len;
+    char buf[LOAD_BUF];
+    int len, i;
 
     f = fopen(path, "rb");
     if (!f) return;
@@ -266,115 +362,180 @@ static void do_load(const char *path)
         nlines++;
         if (nlines >= MAX_LINES) break;
     }
-    if (nlines == 0) { line_init(&lines[0]); nlines = 1; }
     fclose(f);
 
-    strncpy(fname, path, (int)sizeof(fname) - 1);
+    if (nlines == 0) {
+        line_init(&lines[0]);
+        nlines = 1;
+    }
+    
+    fname_len = 0;
+    strncpy(fname, path, sizeof(fname) - 1);
     fname[sizeof(fname) - 1] = '\0';
+
+    fname_len = 0;
+    while (fname[fname_len] && fname_len < (int)sizeof(fname) - 1)
+        fname_len++;
+
+
+    for (i = 0; i < nlines; i++)
+        line_dirty[i] = 1;
+
+    status_dirty  = 1;
+    content_dirty = 1;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Input handling                                                      */
+/*  Input handling                                                     */
 /* ------------------------------------------------------------------ */
 static void handle_key(int ch)
 {
     switch (ch) {
 
-    /* --- control keys --- */
     case CTRL('q'):
         running = 0;
         break;
+
     case CTRL('s'):
         do_save();
         break;
+
     case CTRL('n'):
         do_new();
         break;
 
-    /* --- cursor movement --- */
+    /* Movement ------------------------------------------------------ */
     case KEY_UP:
-        if (cur_row > 0) { cur_row--; clamp_col(); }
+        if (cur_row > 0) {
+            cur_row--;
+            clamp_col();
+            ensure_visible();
+            status_dirty = 1;
+        }
         break;
+
     case KEY_DOWN:
-        if (cur_row < nlines - 1) { cur_row++; clamp_col(); }
+        if (cur_row < nlines - 1) {
+            cur_row++;
+            clamp_col();
+            ensure_visible();
+            status_dirty = 1;
+        }
         break;
+
     case KEY_LEFT:
-        if (cur_col > 0)
+        if (cur_col > 0) {
             cur_col--;
-        else if (cur_row > 0) {
+            status_dirty = 1;
+        } else if (cur_row > 0) {
             cur_row--;
             cur_col = lines[cur_row].len;
+            ensure_visible();
+            status_dirty = 1;
         }
         break;
+
     case KEY_RIGHT:
-        if (cur_col < lines[cur_row].len)
+        if (cur_col < lines[cur_row].len) {
             cur_col++;
-        else if (cur_row < nlines - 1) {
+            status_dirty = 1;
+        } else if (cur_row < nlines - 1) {
             cur_row++;
             cur_col = 0;
+            ensure_visible();
+            status_dirty = 1;
         }
         break;
+
     case KEY_HOME:
         cur_col = 0;
+        status_dirty = 1;
         break;
+
     case KEY_END:
         cur_col = lines[cur_row].len;
+        status_dirty = 1;
         break;
+
     case KEY_PPAGE:
         cur_row -= EDIT_ROWS - 1;
         if (cur_row < 0) cur_row = 0;
         clamp_col();
+        ensure_visible();
+        status_dirty = 1;
         break;
+
     case KEY_NPAGE:
         cur_row += EDIT_ROWS - 1;
         if (cur_row >= nlines) cur_row = nlines - 1;
         clamp_col();
+        ensure_visible();
+        status_dirty = 1;
         break;
 
-    /* --- insert/overwrite toggle --- */
+    /* Insert/overwrite ---------------------------------------------- */
     case KEY_IC:
         ins_mode = !ins_mode;
+        status_dirty = 1;
         break;
 
-    /* --- newline --- */
+    /* Newline -------------------------------------------------------- */
     case '\r':
     case '\n':
     case KEY_ENTER:
         split_line(cur_row, cur_col);
+        line_dirty[cur_row] = 1;
+        line_dirty[cur_row + 1] = 1;
         cur_row++;
-        cur_col  = 0;
+        cur_col = 0;
         modified = 1;
+        content_dirty = 1;
+        status_dirty = 1;
+        ensure_visible();
         break;
 
-    /* --- backspace --- */
+    /* Backspace ------------------------------------------------------ */
     case KEY_BACKSPACE:
     case 127:
     case 8:
         if (cur_col > 0) {
             cur_col--;
             line_del(&lines[cur_row], cur_col);
+            line_dirty[cur_row] = 1;
             modified = 1;
+            content_dirty = 1;
+            status_dirty = 1;
         } else if (cur_row > 0) {
             int prev_len = lines[cur_row - 1].len;
             join_lines(cur_row - 1);
-            cur_row--;
-            cur_col  = prev_len;
+            line_dirty[cur_row - 1] = 1;
             modified = 1;
+            cur_row--;
+            cur_col = prev_len;
+            content_dirty = 1;
+            status_dirty = 1;
+            ensure_visible();
         }
         break;
 
-    /* --- delete --- */
+    /* Delete --------------------------------------------------------- */
     case KEY_DC:
         if (cur_col < lines[cur_row].len) {
             line_del(&lines[cur_row], cur_col);
+            line_dirty[cur_row] = 1;
             modified = 1;
+            content_dirty = 1;
+            status_dirty = 1;
         } else if (cur_row < nlines - 1) {
             join_lines(cur_row);
+            line_dirty[cur_row] = 1;
             modified = 1;
+            content_dirty = 1;
+            status_dirty = 1;
         }
         break;
 
-    /* --- printable / CP437 --- */
+    /* Printable ------------------------------------------------------ */
     default:
         if (ch >= 32 && ch <= 255) {
             if (ins_mode) {
@@ -387,13 +548,16 @@ static void handle_key(int ch)
             }
             cur_col++;
             modified = 1;
+            line_dirty[cur_row] = 1;
+            content_dirty = 1;
+            status_dirty = 1;
         }
         break;
     }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Entry point                                                         */
+/*  Entry point                                                        */
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[])
 {
@@ -403,24 +567,61 @@ int main(int argc, char *argv[])
     if (argc > 1) do_load(argv[1]);
 
     initscr();
+
+    /* Lock curses logical size */
+    resize_term(24, 80);
+
     raw();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(1);
+    
 
 #ifndef __ia16__
+    /* SDL2 window lock via PDCursesMod */
     PDC_set_title("editor");
+    mousemask(0, NULL);
+    PDC_set_blink(0);
+    PDC_set_resize_limits(24, 80, 24, 80); /*lock limits*/
 #endif
 
-    /* Cyan on black -- matches the classic look in the screenshot */
     start_color();
     init_pair(1, COLOR_CYAN, COLOR_BLACK);
     bkgd(COLOR_PAIR(1));
 
+    ensure_visible();
+
     while (running) {
-        draw_screen();
+
+        if (content_dirty)
+            draw_content();
+
+        if (status_dirty)
+            draw_status();
+
+        move(cur_row - top_row, cur_col);
+
+        wnoutrefresh(stdscr);
+        doupdate();
+
         ch = getch();
         handle_key(ch);
+
+        /* Drain queued keys */
+        nodelay(stdscr, TRUE);
+        while (running && (ch = getch()) != ERR) {
+            handle_key(ch);
+
+            if (content_dirty)
+                draw_content();
+            if (status_dirty)
+                draw_status();
+
+            move(cur_row - top_row, cur_col);
+            wnoutrefresh(stdscr);
+            doupdate();
+        }
+        nodelay(stdscr, FALSE);
     }
 
     endwin();
