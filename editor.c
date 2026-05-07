@@ -1,34 +1,68 @@
 /*
- * editor.c  --  minimal CP437 text editor via PDCursesMod/SDL2
+ * editor.c  --  minimal CP437 text editor via thin-vga
  *
- * Deterministic, fixed-geometry 80x24 text mode.
- * Dirty-row rendering, no shadow buffer, no memcmp.
- * SDL2 window locked to fixed size via PDCursesMod.
+ * Deterministic, fixed-geometry 80x25 text mode.
  */
 
-#include <curses.h>
+#ifdef __ia16__
+#  include <i86.h>
+#  include <conio.h>
+#  include <dos.h>
+#  include <bios.h>
+#  define MAX_LINES  2048
+#  define LOAD_BUF   256
+#  define VGA_ROWS   25
+#  define VGA_COLS   80
+
+#  define VGA_BLACK         0
+#  define VGA_BLUE          1
+#  define VGA_GREEN         2
+#  define VGA_CYAN          3
+#  define VGA_RED           4
+#  define VGA_MAGENTA       5
+#  define VGA_BROWN         6
+#  define VGA_LGRAY         7
+#  define VGA_DGRAY         8
+#  define VGA_LBLUE         9
+#  define VGA_LGREEN       10
+#  define VGA_LCYAN        11
+#  define VGA_LRED         12
+#  define VGA_LMAGENTA     13
+#  define VGA_YELLOW       14
+#  define VGA_WHITE        15
+
+#  define VGA_ATTR(bg, fg) (unsigned char)(((bg) & 0x0F) << 4 | ((fg) & 0x0F))
+#  define VGA_ATTR_DEFAULT VGA_ATTR(VGA_BLACK, VGA_LGRAY)
+#  define KEY_CTRL(c) ((c) & 0x1F)
+#  define KEY_BS     0x08
+#  define KEY_ENTER  0x0D
+#  define KEY_TAB    0x09
+#  define KEY_UP     0x4800
+#  define KEY_DOWN   0x5000
+#  define KEY_LEFT   0x4B00
+#  define KEY_RIGHT  0x4D00
+#  define KEY_HOME   0x4700
+#  define KEY_END    0x4F00
+#  define KEY_PGUP   0x4900
+#  define KEY_PGDN   0x5100
+#  define KEY_INS    0x5200
+#  define KEY_DEL    0x5300
+#  define KEY_NONE   -2
+#  define KEY_CLOSED -1
+#else
+#  include "vgaterm.h"
+#  include "vio.h"
+#  define MAX_LINES  65536
+#  define LOAD_BUF   4096
+#endif
+
 #include <stdlib.h>
 #include <string.h>
-
-/* ------------------------------------------------------------------ */
-/*  Portability                                                        */
-/* ------------------------------------------------------------------ */
-#define CTRL(x)  ((x) & 0x1f)
-
-#ifndef KEY_BACKSPACE
-#  define KEY_BACKSPACE 0x107
-#endif
+#include <stdio.h>
 
 /* ------------------------------------------------------------------ */
 /*  Line buffer                                                        */
 /* ------------------------------------------------------------------ */
-#ifdef __ia16__
-#  define MAX_LINES  2048
-#  define LOAD_BUF   256
-#else
-#  define MAX_LINES  65536
-#  define LOAD_BUF   4096
-#endif
 #define LINE_INIT  128
 
 /* ------------------------------------------------------------------ */
@@ -47,11 +81,6 @@ typedef struct {
 
 static Line lines[MAX_LINES];
 static int  nlines = 1;
-
-
-
-
-
 
 /* ------------------------------------------------------------------ */
 /*  Line helpers                                                       */
@@ -147,7 +176,91 @@ static unsigned char line_dirty[MAX_LINES];
 static int status_dirty  = 1;
 static int content_dirty = 1;
 
-#define EDIT_ROWS (LINES - 1)
+#ifdef __ia16__
+/* --- DOS VIO Stubs --- */
+static int s_attr = VGA_ATTR_DEFAULT;
+static int s_col = 0, s_row = 0;
+
+static void vio_gotoxy(int col, int row) {
+    union REGS r;
+    s_col = col; s_row = row;
+    r.h.ah = 0x02; r.h.bh = 0;
+    r.h.dh = (unsigned char)row; r.h.dl = (unsigned char)col;
+    int86(0x10, &r, &r);
+}
+
+static void vio_setattr(int attr) { s_attr = attr; }
+
+static void vio_putch(unsigned char ch) {
+    unsigned char __far *vga = (unsigned char __far *)0xB8000000L;
+    int off = (s_row * 80 + s_col) * 2;
+    vga[off] = ch;
+    vga[off+1] = (unsigned char)s_attr;
+    if (s_col < 79) s_col++;
+    vio_gotoxy(s_col, s_row);
+}
+
+static void vio_puts(const char *s) {
+    while (*s) vio_putch((unsigned char)*s++);
+}
+
+static void vio_puts_n(const char *s, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        vio_putch(s[i] ? (unsigned char)s[i] : ' ');
+        if (!s[i]) s = "";
+    }
+}
+
+static void vio_clreol(void) {
+    int c, old_col = s_col;
+    for (c = s_col; c < 80; c++) vio_putch(' ');
+    vio_gotoxy(old_col, s_row);
+}
+
+static void vio_clrline(int row, int attr) {
+    int c;
+    int old_attr = s_attr;
+    vio_gotoxy(0, row);
+    vio_setattr(attr);
+    for (c = 0; c < 80; c++) vio_putch(' ');
+    vio_setattr(old_attr);
+}
+
+static void vio_clrscr(void) {
+    int r;
+    for (r = 0; r < 25; r++) vio_clrline(r, s_attr);
+    vio_gotoxy(0, 0);
+}
+
+static void vio_uint(unsigned int n, int width) {
+    char buf[10];
+    int i = 0;
+    if (n == 0) buf[i++] = '0';
+    while (n > 0) { buf[i++] = (char)('0' + (n % 10)); n /= 10; }
+    while (width > i) { vio_putch(' '); width--; }
+    while (i > 0) vio_putch((unsigned char)buf[--i]);
+}
+
+static void vio_show_cursor(void) { vio_gotoxy(s_col, s_row); }
+static void vio_flush(void) { }
+static void vio_init(void *vt) { (void)vt; }
+static void vio_fini(void) { }
+
+static int vio_getch(void) {
+    unsigned short k = _bios_keybrd(_KEYBRD_READ);
+    if ((k & 0xFF) != 0) return (int)(k & 0xFF);
+    return (int)(k & 0xFF00);
+}
+
+static int vio_kbhit(void) {
+    unsigned short k = _bios_keybrd(_KEYBRD_READY);
+    if (k == 0) return KEY_NONE;
+    return vio_getch();
+}
+#endif
+
+#define EDIT_ROWS (VGA_ROWS - 1)
 
 /* ------------------------------------------------------------------ */
 /*  Cursor clamp + visibility                                          */
@@ -180,80 +293,38 @@ static void ensure_visible(void)
         content_dirty = 1;
     }
 }
- 
-/* ------------------------------------------------------------------   
-  Drawing                                                               
-    we unrolled this because it was a stdio funciton that was basically 
-    a tiny interperater that was firing nearly every frame with a status bar
-    update (basically every frame with typing)                           
-   ------------------------------------------------------------------   */
+
+/* ------------------------------------------------------------------ */
+/*  Drawing                                                            */
+/* ------------------------------------------------------------------ */
 static void draw_status(void)
 {
-    char bar[80];
-    int pos = 0;
     int page = cur_row / PCL_LPP + 1;
     int line = cur_row % PCL_LPP + 1;
     int col  = cur_col + 1;
-    int i; /*for index*/
 
-    /* fname padded/truncated to 20 chars */
-    for (i = 0; i < 20; i++)
-        bar[pos++] = (i < fname_len) ? fname[i] : ' ';
+    /* Clear status line with cyan background */
+    vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
+    vio_clrline(VGA_ROWS - 1, VGA_ATTR(VGA_CYAN, VGA_BLACK));
 
-    bar[pos++] = ' ';
+    /* Filename and Modified flag */
+    vio_gotoxy(1, VGA_ROWS - 1);
+    vio_puts(fname);
+    if (modified) vio_puts(" *");
 
-    /* p.xxx */
-    bar[pos++] = 'p';
-    bar[pos++] = '.';
-    bar[pos++] = '0' + (page / 100) % 10;
-    bar[pos++] = '0' + (page / 10)  % 10;
-    bar[pos++] = '0' + (page % 10);
-    bar[pos++] = ' ';
+    /* Page, Line, Col stats */
+    vio_gotoxy(25, VGA_ROWS - 1);
+    vio_puts("Pg ");  vio_uint(page, 3);
+    vio_puts("  Ln "); vio_uint(line, 4);
+    vio_puts("  Col "); vio_uint(col, 3);
 
-    /* l.xxxx */
-    bar[pos++] = 'l';
-    bar[pos++] = '.';
-    bar[pos++] = '0' + (line / 1000) % 10;
-    bar[pos++] = '0' + (line / 100)  % 10;
-    bar[pos++] = '0' + (line / 10)   % 10;
-    bar[pos++] = '0' + (line % 10);
-    bar[pos++] = ' ';
-
-    /* c.xxxx */
-    bar[pos++] = 'c';
-    bar[pos++] = '.';
-    bar[pos++] = '0' + (col / 1000) % 10;
-    bar[pos++] = '0' + (col / 100)  % 10;
-    bar[pos++] = '0' + (col / 10)   % 10;
-    bar[pos++] = '0' + (col % 10);
-    bar[pos++] = ' ';
-
-    /* 10cpi literal */
-    bar[pos++] = '1';
-    bar[pos++] = '0';
-    bar[pos++] = 'c';
-    bar[pos++] = 'p';
-    bar[pos++] = 'i';
-    bar[pos++] = ' ';
-
-    /* INS / OVR */
-    bar[pos++] = ins_mode ? 'I' : 'O';
-    bar[pos++] = ins_mode ? 'N' : 'V';
-    bar[pos++] = ins_mode ? 'S' : 'R';
-
-    /* pad rest */
-    while (pos < 80)
-        bar[pos++] = ' ';
-
-    move(LINES - 1, 0);
-    attron(A_REVERSE);
-    addnstr(bar, 80);
-    attroff(A_REVERSE);
+    /* Mode and Typeface info */
+    vio_gotoxy(62, VGA_ROWS - 1);
+    vio_puts("10 CPI  ");
+    vio_puts(ins_mode ? "INSERT" : "OVERWRITE");
 
     status_dirty = 0;
 }
-
-
 
 static void draw_content(void)
 {
@@ -263,23 +334,26 @@ static void draw_content(void)
 
     for (r = 0; r < EDIT_ROWS; r++) {
         int lr = top_row + r;
-        if (lr < 0 || lr >= nlines)
+        if (lr < 0 || lr >= nlines) {
+            vio_gotoxy(0, r);
+            vio_setattr(VGA_ATTR_DEFAULT);
+            vio_clreol();
             continue;
+        }
         if (!line_dirty[lr])
             continue;
 
         txt = lines[lr].buf;
         len = lines[lr].len;
-        if (len > COLS) len = COLS;
+        if (len > VGA_COLS) len = VGA_COLS;
 
-        move(r, 0);
+        vio_gotoxy(0, r);
+        vio_setattr(VGA_ATTR_DEFAULT);
         if (len > 0)
-            addnstr(txt, len);
+            vio_puts_n(txt, len);
 
-        if (len < COLS) {
-            int pad = COLS - len;
-            while (pad--) addch(' ');
-        }
+        if (len < VGA_COLS)
+            vio_clreol();
 
         line_dirty[lr] = 0;
     }
@@ -373,10 +447,7 @@ static void do_load(const char *path)
     strncpy(fname, path, sizeof(fname) - 1);
     fname[sizeof(fname) - 1] = '\0';
 
-    fname_len = 0;
-    while (fname[fname_len] && fname_len < (int)sizeof(fname) - 1)
-        fname_len++;
-
+    fname_len = (int)strlen(fname);
 
     for (i = 0; i < nlines; i++)
         line_dirty[i] = 1;
@@ -390,17 +461,22 @@ static void do_load(const char *path)
 /* ------------------------------------------------------------------ */
 static void handle_key(int ch)
 {
+    if (ch == KEY_CLOSED) {
+        running = 0;
+        return;
+    }
+
     switch (ch) {
 
-    case CTRL('q'):
+    case KEY_CTRL('q'):
         running = 0;
         break;
 
-    case CTRL('s'):
+    case KEY_CTRL('s'):
         do_save();
         break;
 
-    case CTRL('n'):
+    case KEY_CTRL('n'):
         do_new();
         break;
 
@@ -457,7 +533,7 @@ static void handle_key(int ch)
         status_dirty = 1;
         break;
 
-    case KEY_PPAGE:
+    case KEY_PGUP:
         cur_row -= EDIT_ROWS - 1;
         if (cur_row < 0) cur_row = 0;
         clamp_col();
@@ -465,7 +541,7 @@ static void handle_key(int ch)
         status_dirty = 1;
         break;
 
-    case KEY_NPAGE:
+    case KEY_PGDN:
         cur_row += EDIT_ROWS - 1;
         if (cur_row >= nlines) cur_row = nlines - 1;
         clamp_col();
@@ -474,14 +550,12 @@ static void handle_key(int ch)
         break;
 
     /* Insert/overwrite ---------------------------------------------- */
-    case KEY_IC:
+    case KEY_INS:
         ins_mode = !ins_mode;
         status_dirty = 1;
         break;
 
     /* Newline -------------------------------------------------------- */
-    case '\r':
-    case '\n':
     case KEY_ENTER:
         split_line(cur_row, cur_col);
         line_dirty[cur_row] = 1;
@@ -494,10 +568,14 @@ static void handle_key(int ch)
         ensure_visible();
         break;
 
+    case KEY_TAB: {
+        int i;
+        for (i = 0; i < 4; i++) handle_key(' ');
+        break;
+    }
+
     /* Backspace ------------------------------------------------------ */
-    case KEY_BACKSPACE:
-    case 127:
-    case 8:
+    case KEY_BS:
         if (cur_col > 0) {
             cur_col--;
             line_del(&lines[cur_row], cur_col);
@@ -519,7 +597,7 @@ static void handle_key(int ch)
         break;
 
     /* Delete --------------------------------------------------------- */
-    case KEY_DC:
+    case KEY_DEL:
         if (cur_col < lines[cur_row].len) {
             line_del(&lines[cur_row], cur_col);
             line_dirty[cur_row] = 1;
@@ -551,10 +629,41 @@ static void handle_key(int ch)
             line_dirty[cur_row] = 1;
             content_dirty = 1;
             status_dirty = 1;
+
+            /* --- Simple Word Wrap --- */
+            if (cur_col >= VGA_COLS) {
+                int split_at = -1;
+                int i;
+                for (i = cur_col - 1; i >= 0; i--) {
+                    if (lines[cur_row].buf[i] == ' ') {
+                        split_at = i;
+                        break;
+                    }
+                }
+                if (split_at > 0 && split_at > cur_col - 20) {
+                    split_line(cur_row, split_at + 1);
+                    line_del(&lines[cur_row], split_at);
+                    cur_row++;
+                    cur_col = cur_col - (split_at + 1);
+                } else {
+                    split_line(cur_row, cur_col);
+                    cur_row++;
+                    cur_col = 0;
+                }
+                ensure_visible();
+                for (i = 0; i < VGA_ROWS; i++) {
+                    int lr = top_row + i;
+                    if (lr >= 0 && lr < MAX_LINES) line_dirty[lr] = 1;
+                }
+            }
         }
         break;
-    }
 }
+}
+
+#ifdef __ia16__
+typedef void VGATerm;
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Entry point                                                        */
@@ -562,54 +671,38 @@ static void handle_key(int ch)
 int main(int argc, char *argv[])
 {
     int ch;
+    VGATerm *vt = NULL;
+
+#ifndef __ia16__
+    vt = vgaterm_open("editor");
+    if (!vt) return 1;
+#endif
+
+    vio_init(vt);
+    vio_setattr(VGA_ATTR_DEFAULT);
+    vio_clrscr();
 
     line_init(&lines[0]);
     if (argc > 1) do_load(argv[1]);
 
-    initscr();
-
-    /* Lock curses logical size */
-    resize_term(24, 80);
-
-    raw();
-    noecho();
-    keypad(stdscr, TRUE);
-    curs_set(1);
-    
-
-#ifndef __ia16__
-    /* SDL2 window lock via PDCursesMod */
-    PDC_set_title("editor");
-    mousemask(0, NULL);
-    PDC_set_blink(0);
-    PDC_set_resize_limits(24, 80, 24, 80); /*lock limits*/
-#endif
-
-    start_color();
-    init_pair(1, COLOR_CYAN, COLOR_BLACK);
-    bkgd(COLOR_PAIR(1));
-
     ensure_visible();
 
     while (running) {
-
         if (content_dirty)
             draw_content();
 
         if (status_dirty)
             draw_status();
 
-        move(cur_row - top_row, cur_col);
+        vio_gotoxy(cur_col, cur_row - top_row);
+        vio_show_cursor();
+        vio_flush();
 
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        ch = getch();
+        ch = vio_getch();
         handle_key(ch);
 
         /* Drain queued keys */
-        nodelay(stdscr, TRUE);
-        while (running && (ch = getch()) != ERR) {
+        while (running && (ch = vio_kbhit()) != KEY_NONE) {
             handle_key(ch);
 
             if (content_dirty)
@@ -617,13 +710,15 @@ int main(int argc, char *argv[])
             if (status_dirty)
                 draw_status();
 
-            move(cur_row - top_row, cur_col);
-            wnoutrefresh(stdscr);
-            doupdate();
+            vio_gotoxy(cur_col, cur_row - top_row);
+            vio_show_cursor();
+            vio_flush();
         }
-        nodelay(stdscr, FALSE);
     }
 
-    endwin();
+    vio_fini();
+#ifndef __ia16__
+    vgaterm_close(vt);
+#endif
     return 0;
 }

@@ -1,64 +1,49 @@
 # editor
 
-A minimal CP437 text editor built on PDCursesMod. Targets two backends:
+A tiny, deterministic CP437 text editor for modern Linux and vintage DOS.
 
-- **SDL2** — windowed, runs on Linux/Windows/macOS
-- **DOS** — real-mode 16-bit x86, built with ia16-elf-gcc
+Built on the **thin-vga** stack. No SDL, no ncurses, no complex abstractions. Just a raw 4000-byte VGA text buffer and direct hardware access.
+
+- **Linux / X11** — Renders directly via Xlib using an authentic 8x16 VGA bitmap font.
+- **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` for period-correct "CGA snow" and zero-latency feedback.
+
+## Architecture
+
+This editor treats the screen as a flat memory buffer (`character` + `attribute` bytes), exactly like a real VGA card in mode 3.
+
+- **Resolution:** 80x25 characters.
+- **Colors:** 16-color CGA/VGA palette.
+- **Font:** Genuine IBM VGA 8x16 bitmap (built-in for Linux, native for DOS).
+- **Efficiency:** The entire I/O layer is under 500 lines of code.
 
 ## Dependencies
 
-[PDCursesMod](https://github.com/Bill-Gray/PDCursesMod) is required for both
-targets. Clone it alongside this directory:
+### Linux / X11
+
+- `libX11` development libraries.
 
 ```sh
-git clone https://github.com/Bill-Gray/PDCursesMod
-```
-
-### SDL2 target
-
-- SDL2 development libraries
-
-```sh
-sudo apt install libsdl2-dev     # Debian/Ubuntu
-sudo pacman -S sdl2              # Arch
-pacman -S mingw-w64-x86_64-SDL2  # MSYS2/MinGW
+sudo apt install libx11-dev     # Debian/Ubuntu
+sudo pacman -S libx11           # Arch
 ```
 
 ### DOS target
 
-- [ia16-elf-gcc](https://github.com/tkchia/build-ia16) toolchain
-- libi86
+- [ia16-elf-gcc](https://github.com/tkchia/build-ia16) toolchain.
+- `libi86` for DOS/BIOS interrupt support.
 
 ## Build
 
 ```sh
-make          # SDL2 binary  -> ./editor
+make          # Linux binary -> ./editor
 make dos      # DOS binary   -> ./editor.com
 ```
 
-The Makefile builds the appropriate PDCursesMod port automatically on first
-run. Pass a filename as the first argument to open a file on startup:
+Pass a filename as the first argument to open a file on startup:
 
 ```sh
 ./editor myfile.txt
-editor.com myfile.txt
 ```
-
-> **Note on the DOS output format:** ia16-elf-gcc with `-mcmodel=small`
-> produces an MZ `.exe` rather than a true flat `.com`. If the toolchain
-> complains about the `.com` extension just rename the target in the Makefile.
-
-## CP437 font (SDL2 only)
-
-PDCursesMod's SDL2 port ships a built-in CP437 bitmap font. Override it with
-the `PDC_FONT` environment variable:
-
-```sh
-PDC_FONT=/path/to/myfont.bmp ./editor
-```
-
-Ready-to-use fonts live in `PDCursesMod/sdl2/`. On the DOS target CP437 is
-native to the hardware — no font file needed.
 
 ## Keybindings
 
@@ -75,18 +60,19 @@ native to the hardware — no font file needed.
 | Backspace  | Delete before cursor     |
 | Delete     | Delete under cursor      |
 
-Characters 32–255 are passed straight through, so any CP437 glyph reachable
-from your keyboard or input method will be inserted as-is.
+Characters 32–255 are passed straight through as CP437 glyphs.
 
 ## Status bar
 
 ```
- [new]                p.1   l.1    c.1    INS
-  ^filename           ^page ^line  ^col   ^mode
+ [new] *             Pg 1  Ln 1  Col 1  10 CPI  INSERT
+  ^filename          ^page ^line ^col   ^fixed  ^mode
 ```
+The `*` indicator appears when the file has unsaved changes.
 
 ## Roadmap
 
 - [ ] Command bar for `save-as`, `open`, `quit-confirm`
 - [ ] Undo / redo
 - [ ] Search / replace
+- [ ] Wait-for-retrace option on DOS (to eliminate "snow")
