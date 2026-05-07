@@ -5,7 +5,7 @@ A tiny, deterministic CP437 text editor for modern Linux and vintage DOS.
 Built on the **thin-vga** stack. No SDL, no ncurses, no complex abstractions. Just a raw 4000-byte VGA text buffer and direct hardware access.
 
 - **Linux / X11** — Renders directly via Xlib using an authentic 8x16 VGA bitmap font.
-- **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` for period-correct "CGA snow" and zero-latency feedback.
+- **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` with optimized cursor sync for zero-latency feedback and minimal flicker.
 
 ## Architecture
 
@@ -75,4 +75,4 @@ The `*` indicator appears when the file has unsaved changes.
 - [ ] Command bar for `save-as`, `open`, `quit-confirm`
 - [ ] Undo / redo
 - [ ] Search / replace
-- [ ] Wait-for-retrace option on DOS (to eliminate "snow")
+
