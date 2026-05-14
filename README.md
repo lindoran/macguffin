@@ -54,6 +54,23 @@ Pass a filename as the first argument to open a file on startup:
 ./editor myfile.txt
 ```
 
+## Editing Model
+
+Macguffin edits fixed 80-column lines. A newline is a hard line break, and the editor wraps by inserting real lines rather than maintaining a hidden flow model. The top screen row is a ruler:
+
+```text
+|---L----------------------------------^----------------------------------R---|
+```
+
+The markers are:
+
+- `|` page stops
+- `L` left tab / normal typing start
+- `^` derived center tab
+- `R` right tab / normal wrap target
+
+The default page stops are columns `0` and `79`, with tab stops four columns inward. `tab 0` makes the tab stops equal to the page stops, which disables auto-indent.
+
 ## Keybindings
 
 | Key        | Action                   |
@@ -61,15 +78,74 @@ Pass a filename as the first argument to open a file on startup:
 | Ctrl-S     | Save (no-op if unnamed)  |
 | Ctrl-N     | New file                 |
 | Ctrl-Q     | Quit                     |
+| Ctrl-B     | Insert page break        |
+| Ctrl-J     | Justify word under cursor |
+| Ctrl-R     | Capture current row as repeating page header |
+| Esc        | Open / close console     |
+| Tab        | Insert current tab size spaces |
 | Insert     | Toggle INS / OVR         |
 | Arrows     | Move cursor              |
-| Home / End | Start / end of line      |
+| Home / End | Left tab / end of line   |
 | PgUp/PgDn  | Scroll a screenful       |
 | Enter      | Split line               |
 | Backspace  | Delete before cursor     |
 | Delete     | Delete under cursor      |
 
 Characters 32–255 are passed straight through as CP437 glyphs.
+
+## Console
+
+Press `Esc` to open the bottom-row console. Press `Esc` again to close it, or press `Esc` once to clear an error and a second time to close.
+
+Commands:
+
+| Command | Action |
+|---------|--------|
+| `save` | Save the current file |
+| `save as PATH` | Save using `PATH`'s extension |
+| `load PATH` | Load a text or `.mgf` file |
+| `export PATH` | Write print/plain-text output with page macros expanded |
+| `quit` | Quit |
+| `tab N` / `tabs N` | Set tab size and symmetric tab stops |
+| `stops N` | Set page stops to `N` and `79 - N` |
+| `page N` | Set page length in lines |
+| `break` | Insert a page break |
+
+## Justification
+
+`Ctrl-J` operates on the word under the cursor. Repeated presses move the word through the active stops:
+
+- before center: center on `^`
+- at/after center: right-justify to `R`
+- at `R`: right-justify to the right page stop and start the next line
+
+Justification preserves text to the left of the justified word, clears only to the right of that word, and keeps `$p` / `$t` macros literal while editing.
+
+## Page Headers
+
+Move the cursor to a row and press `Ctrl-R` to capture that row as the repeating page header. When editing creates a new line at a page boundary, Macguffin inserts the captured header row and reserves that line before continuing text.
+
+Header text may contain page macros:
+
+- `$p` expands to the current page number on export/plain-text save
+- `$t` expands to the total page count on export/plain-text save
+
+## Page Breaks
+
+Press `Ctrl-B`, or run `break` in the console, to insert an early page break. Macguffin inserts a blue `- break -` marker centered on the center tab, pads the document to the next page boundary, and keeps any repeating page header structure in place.
+
+The marker is editor metadata. It is saved in `.mgf`, but it does not print or export as text. Plain-text export currently uses LF line endings (`\n`, byte `0x0A`), so the page break becomes however many LF line breaks are needed to reach the next page.
+
+## Files
+
+Macguffin has two save modes:
+
+- `.mgf` project files preserve Macguffin state: document rows, page length, and the repeating header template/state. Literal `$p` and `$t` are preserved.
+- `.txt` files are print/export output. Page macros are expanded to visible numbers, and the file contains ordinary text rows only.
+
+Use `save as name.mgf` for a project file and `save as name.txt` for plain text. Unknown extensions ask whether to save as an `.mgf` project. `Ctrl-S` on an unnamed file opens a console error prompting `type save as <filename>`.
+
+Tab stops and page stops are not stored in `.mgf`; they behave like typewriter setup.
 
 ## Status bar
 
@@ -81,7 +157,7 @@ The `*` indicator appears when the file has unsaved changes.
 
 ## Roadmap
 
-- [ ] Command bar for `save-as`, `open`, `quit-confirm`
+- [ ] Save-as / unnamed-file save flow
+- [ ] Explicit page breaks
 - [ ] Undo / redo
 - [ ] Search / replace
-
