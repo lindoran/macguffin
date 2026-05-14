@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------
-#  Makefile -- editor against thin-vga + ia16 DOS support
+#  Makefile -- macguffin against thin-vga + ia16 DOS support
 # ---------------------------------------------------------------
 
 VGADIR  = deps/thin-vga

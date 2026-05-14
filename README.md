@@ -1,4 +1,4 @@
-# editor
+# Macguffin
 
 A tiny, deterministic CP437 text editor for modern Linux and vintage DOS.
 
@@ -7,6 +7,15 @@ Built on the **thin-vga** stack. No SDL, no ncurses, no complex abstractions. Ju
 - **Linux / X11** — Renders directly via Xlib using an authentic 8x16 VGA bitmap font.
 - **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` with optimized cursor sync for zero-latency feedback and minimal flicker.
 
+## Why Macguffin?
+A MacGuffin is a story element — generally an object (the Holy Grail, the Maltese Falcon, a glowing briefcase) that drives the story forward without becoming the story itself. The editor works the same way: it should not be what you think about while writing.
+
+Every modern writing tool is built around a screen-flow model — text reflows to fit the viewport, and the notion of a physical page is an afterthought bolted on at export time. This produces documents that look fine on screen and uncertain on paper.
+
+macguffin works the other way around. The document is defined in terms of a physical page from the moment you start typing: a pitch, a margin, a column width. Like a 90s word processor. The ruler at the top of the screen shows exactly where the boundaries are. What you type is what goes to the printer, column for column, line for line. The screen render is as close as can be to an ideal manuscript esthetic.
+
+Macguffin tries really hard to work like you write.  You don't have to grab the mouse, you don't move your fingers from the keys - you type and macguffin keeps splitting lines at your specified column width tab stop, and lets you justify text without taking over the formatting for the whole line. Macguffin just works, is minimal and lets you get to writing with the immediacy of a typewriter, but it's not -- it's better.
+
 ## Architecture
 
 This editor treats the screen as a flat memory buffer (`character` + `attribute` bytes), exactly like a real VGA card in mode 3.
@@ -14,7 +23,7 @@ This editor treats the screen as a flat memory buffer (`character` + `attribute`
 - **Resolution:** 80x25 characters.
 - **Colors:** 16-color CGA/VGA palette.
 - **Font:** Genuine IBM VGA 8x16 bitmap (built-in for Linux, native for DOS).
-- **Efficiency:** The entire I/O layer is under 500 lines of code.
+- **Efficiency:** The entire I/O layer is very small, stays out of the way and assures macguffin won't bind up even on tiny hardware
 
 ## Dependencies
 
