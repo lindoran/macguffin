@@ -53,6 +53,11 @@ Pass a filename as the first argument to open a file on startup:
 ```sh
 ./editor myfile.txt
 ```
+Scaling option
+
+```sh
+./editor --scale=2  # 2x scaling use 4 for 4x
+```
 
 ## Editing Model
 
@@ -105,6 +110,7 @@ Commands:
 |---------|--------|
 | `save` | Save the current file |
 | `save as PATH` | Save using `PATH`'s extension |
+| `scale` | Scale n = 1,2,4 for 1x 2x and 4x scaling |
 | `load PATH` | Load a text or `.mgf` file |
 | `export PATH` | Write print/plain-text output with page macros expanded |
 | `quit` | Quit |
