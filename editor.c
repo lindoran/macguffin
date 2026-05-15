@@ -260,6 +260,11 @@ static int ruler_dirty   = 1;
 
 static TabStops tabs;
 static Console console_state;
+
+#ifndef __ia16__
+static VGATerm *g_vt     = NULL; /* set after vgaterm_open; used by command_scale */
+static int      vga_scale = 1;   /* current scaling: 1, 2, or 4                   */
+#endif
 static char page_header[PAGE_HEADER_MAX + 1];
 static int  page_header_len = 0;
 static int  page_header_active = 0;
@@ -772,8 +777,10 @@ static int save_to_path(const char *path, int project)
     if (err != 0)
         return err;
 
-    strncpy(fname, path, sizeof(fname) - 1);
-    fname[sizeof(fname) - 1] = '\0';
+    if (path != fname) {
+        strncpy(fname, path, sizeof(fname) - 1);
+        fname[sizeof(fname) - 1] = '\0';
+    }
     modified = 0;
     status_dirty = 1;
     return 0;
@@ -1497,6 +1504,26 @@ static void handle_pending_save_as(int ch)
     }
 }
 
+#ifndef __ia16__
+static void command_scale(const char *arg)
+{
+    int n = 0;
+
+    if (!parse_uint(arg, &n) || (n != 1 && n != 2 && n != 4)) {
+        set_console_error("scale: use 1, 2, or 4");
+        return;
+    }
+    if (vgaterm_setup_scaling(g_vt, n) != 0) {
+        set_console_error("scale: resize failed");
+        return;
+    }
+    vga_scale = n;
+    mark_visible_dirty();
+    ruler_dirty  = 1;
+    status_dirty = 1;
+}
+#endif
+
 static void console_execute(void)
 {
     char cmd[80];
@@ -1535,6 +1562,10 @@ static void console_execute(void)
         }
     } else if (strcmp(arg, "quit") == 0) {
         running = 0;
+#ifndef __ia16__
+    } else if (strncmp(arg, "scale ", 6) == 0) {
+        command_scale(arg + 6);
+#endif
     } else if (arg[0] == '\0') {
         console_exit();
     } else {
@@ -1815,10 +1846,34 @@ int main(int argc, char *argv[])
 {
     int ch;
     VGATerm *vt = NULL;
+#ifndef __ia16__
+    int i;
+    int new_scale;
+    int n_scale;
+    const char *load_file;
+#endif
 
 #ifndef __ia16__
+    new_scale = 1;
+    load_file = NULL;
+
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--scale=", 8) == 0) {
+            n_scale = 0;
+            parse_uint(argv[i] + 8, &n_scale);
+            if (n_scale == 1 || n_scale == 2 || n_scale == 4)
+                new_scale = n_scale;
+        } else if (load_file == NULL) {
+            load_file = argv[i];
+        }
+    }
+
     vt = vgaterm_open("editor");
     if (!vt) return 1;
+    if (new_scale != 1)
+        vgaterm_setup_scaling(vt, new_scale);
+    vga_scale = new_scale;
+    g_vt = vt;
 #endif
 
     vio_init(vt);
@@ -1830,7 +1885,11 @@ int main(int argc, char *argv[])
 
     line_init(&lines[0]);
     cur_col = tabs.left_tab;
+#ifdef __ia16__
     if (argc > 1) do_load(argv[1]);
+#else
+    if (load_file) do_load(load_file);
+#endif
 
     ensure_visible();
 
