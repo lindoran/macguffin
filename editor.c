@@ -74,8 +74,9 @@
 #define PCL_LPP    66
 #define PCL_CPL    80
 #define PAGE_HEADER_MAX PCL_CPL
-#define LINE_FLAG_REPEAT 0x01
+#define LINE_FLAG_REPEAT     0x01
 #define LINE_FLAG_PAGE_BREAK 0x02
+#define LINE_FLAG_FOOTER     0x04
 
 typedef struct {
     char *buf;
@@ -128,10 +129,12 @@ static void line_free(Line *l)
 
 static void line_grow(Line *l, int need)
 {
-    while (l->cap <= need + 1) {
+    char *tmp;
+    if (l->cap == 0) l->cap = LINE_INIT;
+    while (l->cap <= need + 1)
         l->cap *= 2;
-        l->buf = (char *)realloc(l->buf, (size_t)l->cap);
-    }
+    tmp = (char *)realloc(l->buf, (size_t)l->cap);
+    if (tmp) l->buf = tmp;
 }
 
 static void line_ins(Line *l, int pos, char c)
@@ -249,7 +252,6 @@ static int  modified = 0;
 static int  running  = 1;
 static int  page_len = PCL_LPP;
 static char fname[512] = "[new]";
-static int  fname_len   = 5;   /* strlen("[new]") */
 
 static unsigned char line_dirty[MAX_LINES];
 static int status_dirty  = 1;
@@ -261,6 +263,10 @@ static Console console_state;
 static char page_header[PAGE_HEADER_MAX + 1];
 static int  page_header_len = 0;
 static int  page_header_active = 0;
+
+static char page_footer[PAGE_HEADER_MAX + 1];
+static int  page_footer_len = 0;
+static int  page_footer_active = 0;
 
 #ifdef __ia16__
 /* --- DOS VIO Stubs --- */
@@ -520,6 +526,8 @@ static int line_attr(int lr)
         return VGA_ATTR(VGA_BLUE, VGA_WHITE);
     if (line_flags[lr] & LINE_FLAG_REPEAT)
         return VGA_ATTR(VGA_RED, VGA_WHITE);
+    if (line_flags[lr] & LINE_FLAG_FOOTER)
+        return VGA_ATTR(VGA_GREEN, VGA_WHITE);
     return VGA_ATTR_DEFAULT;
 }
 
@@ -575,12 +583,15 @@ static void reset_editor(void)
     page_header_len = 0;
     page_header[0] = '\0';
 
+    page_footer_active = 0;
+    page_footer_len = 0;
+    page_footer[0] = '\0';
+
     line_init(&lines[0]);
 
-    for (i = 0; i < MAX_LINES; i++)
+    for (i = 0; i < EDIT_ROWS; i++)
         line_dirty[i] = 1;
-    for (i = 0; i < MAX_LINES; i++)
-        line_flags[i] = 0;
+    memset(line_flags, 0, sizeof(line_flags));
 
     status_dirty  = 1;
     content_dirty = 1;
@@ -591,7 +602,6 @@ static void do_new(void)
 {
     reset_editor();
     strcpy(fname, "[new]");
-    fname_len = 5;
 }
 
 static int total_pages(void)
@@ -728,10 +738,16 @@ static int save_project(const char *path)
     f = fopen(path, "wb");
     if (!f) return -1;
 
-    fprintf(f, "MGF2\n");
+    fprintf(f, "MGF4\n");
     fprintf(f, "page %d\n", page_len);
+    fprintf(f, "stops %d %d %d %d %d\n",
+            tabs.left_page, tabs.right_page,
+            tabs.left_tab, tabs.right_tab, tabs.tab_size);
     fprintf(f, "header %d ", page_header_active ? 1 : 0);
     file_put_hex(f, page_header, page_header_len);
+    fputc('\n', f);
+    fprintf(f, "footer %d ", page_footer_active ? 1 : 0);
+    file_put_hex(f, page_footer, page_footer_len);
     fputc('\n', f);
     fprintf(f, "lines %d\n", nlines);
     for (i = 0; i < nlines; i++) {
@@ -758,7 +774,6 @@ static int save_to_path(const char *path, int project)
 
     strncpy(fname, path, sizeof(fname) - 1);
     fname[sizeof(fname) - 1] = '\0';
-    fname_len = (int)strlen(fname);
     modified = 0;
     status_dirty = 1;
     return 0;
@@ -808,6 +823,22 @@ static int load_project(FILE *f, int version)
     if (sscanf(buf, "page %d", &page_len) != 1 || page_len < 2)
         return -1;
 
+    if (version >= 3) {
+        int lp, rp, lt, rt, ts;
+        if (!fgets(buf, (int)sizeof(buf), f))
+            return -1;
+        if (sscanf(buf, "stops %d %d %d %d %d", &lp, &rp, &lt, &rt, &ts) != 5)
+            return -1;
+        if (tab_values_valid(lp, lt, rt, rp) && ts > 0 && ts < VGA_COLS) {
+            tabs.left_page  = lp;
+            tabs.right_page = rp;
+            tabs.left_tab   = lt;
+            tabs.right_tab  = rt;
+            tabs.tab_size   = ts;
+            tabs.center_tab = tab_center(lt, rt);
+        }
+    }
+
     if (!fgets(buf, (int)sizeof(buf), f))
         return -1;
     if (strncmp(buf, "header ", 7) != 0)
@@ -828,6 +859,29 @@ static int load_project(FILE *f, int version)
         if (page_header_len > 0)
             memcpy(page_header, tmp.buf, (size_t)page_header_len);
         page_header[page_header_len] = '\0';
+        line_free(&tmp);
+    }
+
+    if (version >= 4) {
+        Line tmp;
+        if (!fgets(buf, (int)sizeof(buf), f))
+            return -1;
+        if (strncmp(buf, "footer ", 7) != 0)
+            return -1;
+        page_footer_active = buf[7] == '1';
+        if (buf[8] != ' ')
+            return -1;
+        line_init(&tmp);
+        if (!line_from_hex(&tmp, buf + 9)) {
+            line_free(&tmp);
+            return -1;
+        }
+        page_footer_len = tmp.len;
+        if (page_footer_len > PAGE_HEADER_MAX)
+            page_footer_len = PAGE_HEADER_MAX;
+        if (page_footer_len > 0)
+            memcpy(page_footer, tmp.buf, (size_t)page_footer_len);
+        page_footer[page_footer_len] = '\0';
         line_free(&tmp);
     }
 
@@ -887,6 +941,10 @@ static int do_load(const char *path)
             project_version = 1;
         } else if (strcmp(buf, "MGF2\n") == 0 || strcmp(buf, "MGF2\r\n") == 0) {
             project_version = 2;
+        } else if (strcmp(buf, "MGF3\n") == 0 || strcmp(buf, "MGF3\r\n") == 0) {
+            project_version = 3;
+        } else if (strcmp(buf, "MGF4\n") == 0 || strcmp(buf, "MGF4\r\n") == 0) {
+            project_version = 4;
         } else {
             fclose(f);
             return -1;
@@ -923,11 +981,8 @@ static int do_load(const char *path)
         nlines = 1;
     }
     
-    fname_len = 0;
     strncpy(fname, path, sizeof(fname) - 1);
     fname[sizeof(fname) - 1] = '\0';
-
-    fname_len = (int)strlen(fname);
 
     for (i = 0; i < nlines; i++)
         line_dirty[i] = 1;
@@ -960,6 +1015,8 @@ static void reserve_page_header_if_needed(void)
         return;
     if (cur_row <= 0 || cur_row % page_len != 0)
         return;
+    if (line_flags[cur_row] & LINE_FLAG_REPEAT)
+        return; /* header already present at this boundary */
     if (nlines >= MAX_LINES)
         return;
 
@@ -970,18 +1027,133 @@ static void reserve_page_header_if_needed(void)
     mark_visible_dirty();
 }
 
+static void reserve_page_footer_if_needed(void)
+{
+    if (!page_footer_active)
+        return;
+    if (page_len <= 1)
+        return;
+    if (cur_row <= 0 || cur_row % page_len != page_len - 1)
+        return;
+    if (line_flags[cur_row] & LINE_FLAG_FOOTER)
+        return; /* footer already present at this boundary */
+    if (nlines >= MAX_LINES)
+        return;
+
+    insert_line_copy(cur_row, page_footer, page_footer_len, LINE_FLAG_FOOTER);
+    line_dirty[cur_row] = 1;
+    cur_row++;
+    line_dirty[cur_row] = 1;
+    mark_visible_dirty();
+}
+
+static void remove_row(int row)
+{
+    int i;
+    if (row < 0 || row >= nlines) return;
+    line_free(&lines[row]);
+    for (i = row; i < nlines - 1; i++) {
+        lines[i]      = lines[i + 1];
+        line_flags[i] = line_flags[i + 1];
+        line_dirty[i] = 1;
+    }
+    nlines--;
+    if (nlines < 1) {
+        line_init(&lines[0]);
+        nlines = 1;
+    }
+    mark_visible_dirty();
+}
+
+static void move_to_header(void)
+{
+    int page_start = (cur_row / page_len) * page_len;
+    char tmp[PAGE_HEADER_MAX + 1];
+    int  tmp_len;
+
+    if (cur_row == page_start) {
+        line_flags[cur_row] = (line_flags[cur_row] & ~LINE_FLAG_FOOTER) | LINE_FLAG_REPEAT;
+        line_dirty[cur_row] = 1;
+        modified = 1;
+        status_dirty = 1;
+        return;
+    }
+
+    tmp_len = lines[cur_row].len;
+    if (tmp_len > PAGE_HEADER_MAX) tmp_len = PAGE_HEADER_MAX;
+    if (tmp_len > 0) memcpy(tmp, lines[cur_row].buf, (size_t)tmp_len);
+    tmp[tmp_len] = '\0';
+
+    remove_row(cur_row);
+    /* page_start <= original cur_row so index is unchanged after removal */
+    insert_line_copy(page_start, tmp, tmp_len, LINE_FLAG_REPEAT);
+    cur_row = page_start;
+    cur_col = tabs.left_tab;
+    ensure_visible();
+    mark_visible_dirty();
+    modified = 1;
+    status_dirty = 1;
+}
+
+static void move_to_footer(void)
+{
+    int page_end = (cur_row / page_len + 1) * page_len - 1;
+    char tmp[PAGE_HEADER_MAX + 1];
+    int  tmp_len;
+
+    if (page_end >= nlines) page_end = nlines - 1;
+
+    if (cur_row == page_end) {
+        line_flags[cur_row] = (line_flags[cur_row] & ~LINE_FLAG_REPEAT) | LINE_FLAG_FOOTER;
+        line_dirty[cur_row] = 1;
+        modified = 1;
+        status_dirty = 1;
+        return;
+    }
+
+    tmp_len = lines[cur_row].len;
+    if (tmp_len > PAGE_HEADER_MAX) tmp_len = PAGE_HEADER_MAX;
+    if (tmp_len > 0) memcpy(tmp, lines[cur_row].buf, (size_t)tmp_len);
+    tmp[tmp_len] = '\0';
+
+    remove_row(cur_row);
+    /* If page_end was below cur_row it's now shifted down by one */
+    if (page_end > cur_row) page_end--;
+
+    insert_line_copy(page_end + 1, tmp, tmp_len, LINE_FLAG_FOOTER);
+    cur_row = page_end + 1;
+    if (cur_row >= nlines) cur_row = nlines - 1;
+    cur_col = tabs.left_tab;
+    ensure_visible();
+    mark_visible_dirty();
+    modified = 1;
+    status_dirty = 1;
+}
+
 static void repeat_current_row(void)
 {
     Line *l = &lines[cur_row];
+    int len  = l->len;
+    int is_header = line_flags[cur_row] & LINE_FLAG_REPEAT;
+    int is_footer = line_flags[cur_row] & LINE_FLAG_FOOTER;
 
-    page_header_len = l->len;
-    if (page_header_len > PAGE_HEADER_MAX)
-        page_header_len = PAGE_HEADER_MAX;
-    if (page_header_len > 0)
-        memcpy(page_header, l->buf, (size_t)page_header_len);
-    page_header[page_header_len] = '\0';
-    page_header_active = 1;
-    line_flags[cur_row] |= LINE_FLAG_REPEAT;
+    if (!is_header && !is_footer)
+        return; /* Ctrl+R only valid on a header or footer line */
+
+    if (len > PAGE_HEADER_MAX) len = PAGE_HEADER_MAX;
+
+    if (is_header) {
+        page_header_len = len;
+        if (len > 0) memcpy(page_header, l->buf, (size_t)len);
+        page_header[len] = '\0';
+        page_header_active = 1;
+    } else {
+        page_footer_len = len;
+        if (len > 0) memcpy(page_footer, l->buf, (size_t)len);
+        page_footer[len] = '\0';
+        page_footer_active = 1;
+    }
+
     line_dirty[cur_row] = 1;
     modified = 1;
     content_dirty = 1;
@@ -1025,6 +1197,7 @@ static void insert_page_break(void)
     }
 
     cur_row = row;
+    reserve_page_footer_if_needed();
     reserve_page_header_if_needed();
     prefix_line_spaces(&lines[cur_row], tabs.left_tab);
     cur_col = tabs.left_tab;
@@ -1071,6 +1244,7 @@ static void wrap_current_line(void)
     cur_row++;
     if (cur_col < tabs.left_tab)
         cur_col = tabs.left_tab;
+    reserve_page_footer_if_needed();
     reserve_page_header_if_needed();
     prefix_line_spaces(&lines[cur_row], tabs.left_tab);
 
@@ -1191,7 +1365,8 @@ static void justify_current_word(void)
     if (make_break && nlines < MAX_LINES) {
         split_line(cur_row, l->len);
         cur_row++;
-        reserve_page_header_if_needed();
+        reserve_page_footer_if_needed();
+    reserve_page_header_if_needed();
         prefix_line_spaces(&lines[cur_row], tabs.left_tab);
         cur_col = tabs.left_tab;
         line_dirty[cur_row] = 1;
@@ -1452,6 +1627,14 @@ static void handle_key(int ch)
         justify_current_word();
         break;
 
+    case KEY_CTRL('t'):
+        move_to_header();
+        break;
+
+    case KEY_CTRL('f'):
+        move_to_footer();
+        break;
+
     case KEY_CTRL('r'):
         repeat_current_row();
         break;
@@ -1464,6 +1647,14 @@ static void handle_key(int ch)
     case KEY_UP:
         if (cur_row > 0) {
             cur_row--;
+            /* If we landed in page-break padding, snap up to the marker */
+            if (lines[cur_row].len == 0 && line_flags[cur_row] == 0) {
+                int r = cur_row;
+                while (r > 0 && lines[r].len == 0 && line_flags[r] == 0)
+                    r--;
+                if (line_flags[r] & LINE_FLAG_PAGE_BREAK)
+                    cur_row = r;
+            }
             clamp_col();
             ensure_visible();
             status_dirty = 1;
@@ -1472,7 +1663,15 @@ static void handle_key(int ch)
 
     case KEY_DOWN:
         if (cur_row < nlines - 1) {
+            int was_break = line_flags[cur_row] & LINE_FLAG_PAGE_BREAK;
             cur_row++;
+            /* If we left a break marker, skip over the blank padding */
+            if (was_break) {
+                while (cur_row < nlines - 1 &&
+                       lines[cur_row].len == 0 &&
+                       line_flags[cur_row] == 0)
+                    cur_row++;
+            }
             clamp_col();
             ensure_visible();
             status_dirty = 1;
@@ -1541,7 +1740,8 @@ static void handle_key(int ch)
         line_dirty[cur_row] = 1;
         line_dirty[cur_row + 1] = 1;
         cur_row++;
-        reserve_page_header_if_needed();
+        reserve_page_footer_if_needed();
+    reserve_page_header_if_needed();
         prefix_line_spaces(&lines[cur_row], tabs.left_tab);
         cur_col = tabs.left_tab;
         modified = 1;
