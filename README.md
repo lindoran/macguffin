@@ -4,15 +4,16 @@ A tiny, deterministic CP437 text editor for modern Linux and vintage DOS.
 
 Built on the **thin-vga** stack. No SDL, no ncurses, no complex abstractions. Just a raw 4000-byte VGA text buffer and direct hardware access.
 
-- **Linux / X11** — Renders directly via Xlib using an authentic 8x16 VGA bitmap font.
+- **Linux / X11** — Renders directly via Xlib using an authentic 8×16 VGA bitmap font.
 - **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` with optimized cursor sync for zero-latency feedback and minimal flicker.
 
 ## Why Macguffin?
+
 A MacGuffin is a story element — generally an object (the Holy Grail, the Maltese Falcon, a glowing briefcase) that drives the story forward without becoming the story itself. The editor works the same way: it should not be what you think about while writing.
 
 Every modern writing tool is built around a screen-flow model — text reflows to fit the viewport, and the notion of a physical page is an afterthought bolted on at export time. This produces documents that look fine on screen and uncertain on paper.
 
-Macguffin works the other way around. The document is defined in terms of a physical page from the moment you start typing: a pitch, a margin, a column width. Like a 90s word processor. The ruler at the top of the screen shows exactly where the boundaries are. What you type is what goes to the printer, column for column, line for line. The screen render is as close as can be to an ideal manuscript esthetic.
+Macguffin works the other way around. The document is defined in terms of a physical page from the moment you start typing: a pitch, a margin, a column width. Like a 90s word processor. The ruler at the top of the screen shows exactly where the boundaries are. What you type is what goes to the printer, column for column, line for line.
 
 Macguffin tries really hard to work like you write. You don't have to grab the mouse, you don't move your fingers from the keys — you type and Macguffin keeps splitting lines at your specified column width tab stop, and lets you justify text without taking over the formatting for the whole line. Macguffin just works, is minimal and lets you get to writing with the immediacy of a typewriter, but it's not — it's better.
 
@@ -20,9 +21,9 @@ Macguffin tries really hard to work like you write. You don't have to grab the m
 
 This editor treats the screen as a flat memory buffer (`character` + `attribute` bytes), exactly like a real VGA card in mode 3.
 
-- **Resolution:** 80x25 characters.
+- **Resolution:** 80×25 characters.
 - **Colors:** 16-color CGA/VGA palette.
-- **Font:** Genuine IBM VGA 8x16 bitmap (built-in for Linux, native for DOS).
+- **Font:** Genuine IBM VGA 8×16 bitmap (built-in for Linux, native for DOS).  A second italic font slot is generated at build time from FreeMonoOblique via `mkitalic.py`.
 - **Efficiency:** The entire I/O layer is very small, stays out of the way and assures Macguffin won't bind up even on tiny hardware.
 
 ## Dependencies
@@ -30,10 +31,11 @@ This editor treats the screen as a flat memory buffer (`character` + `attribute`
 ### Linux / X11
 
 - `libX11` development libraries.
+- `python3-pillow` for italic font generation.
 
 ```sh
-sudo apt install libx11-dev     # Debian/Ubuntu
-sudo pacman -S libx11           # Arch
+sudo apt install libx11-dev python3-pillow     # Debian/Ubuntu
+sudo pacman -S libx11 python-pillow            # Arch
 ```
 
 ### DOS target
@@ -53,10 +55,11 @@ Pass a filename as the first argument to open a file on startup:
 ```sh
 ./editor myfile.txt
 ```
-Scaling option
+
+Scaling option:
 
 ```sh
-./editor --scale=2  # 2x scaling use 4 for 4x
+./editor --scale=2   # 2× pixel scaling; use 4 for 4×
 ```
 
 ## Editing Model
@@ -78,27 +81,71 @@ The default page stops are columns `0` and `79`, with tab stops four columns inw
 
 ## Keybindings
 
-| Key        | Action                   |
-|------------|--------------------------|
-| Ctrl-S     | Save (no-op if unnamed)  |
-| Ctrl-N     | New file                 |
-| Ctrl-Q     | Quit                     |
-| Ctrl-B     | Insert page break        |
-| Ctrl-J     | Justify word under cursor |
+| Key        | Action                            |
+|------------|-----------------------------------|
+| Ctrl-S     | Save (no-op if unnamed)           |
+| Ctrl-N     | New file                          |
+| Ctrl-Q     | Quit                              |
+| Ctrl-B     | Toggle **Bold**                   |
+| Ctrl-L     | Toggle *Italic*                   |
+| Ctrl-U     | Toggle Underline                  |
+| Ctrl-J     | Justify word under cursor         |
 | Ctrl-T     | Move current line to page header slot |
 | Ctrl-F     | Move current line to page footer slot |
 | Ctrl-R     | Arm current header/footer line as repeating template |
-| Esc        | Open / close console     |
-| Tab        | Insert current tab size spaces |
-| Insert     | Toggle INS / OVR         |
-| Arrows     | Move cursor              |
-| Home / End | Left tab / end of line   |
-| PgUp/PgDn  | Scroll a screenful       |
-| Enter      | Split line               |
-| Backspace  | Delete before cursor     |
-| Delete     | Delete under cursor      |
+| Esc        | Open / close console              |
+| Tab        | Insert current tab size spaces    |
+| Insert     | Toggle INS / OVR                  |
+| Arrows     | Move cursor                       |
+| Home / End | Left tab / end of line            |
+| PgUp/PgDn  | Scroll a screenful                |
+| Enter      | Split line                        |
+| Backspace  | Delete before cursor              |
+| Delete     | Delete under cursor               |
 
 Characters 32–255 are passed straight through as CP437 glyphs.
+
+## Rich Text
+
+Macguffin supports three character-level formatting attributes: **Bold**, *Italic*, and Underline. These are stored per character and travel with the text through wrapping, joining, splitting, and undo.
+
+| Attribute | Key    | Screen rendering            | PCL3 output          |
+|-----------|--------|-----------------------------|----------------------|
+| Bold      | Ctrl-B | Bright foreground intensity | Stroke weight +3     |
+| Italic    | Ctrl-L | Alternate italic font slot  | Posture: italic      |
+| Underline | Ctrl-U | Pixel underline on row 14   | PCL underline mode   |
+
+All eight combinations (B × I × U) work simultaneously. The current active attributes are shown in the status bar:
+
+```
+... B I U INS
+    ↑ ↑ ↑
+    │ │ └── Underline active (bright) / inactive (dim)
+    │ └──── Italic active / inactive
+    └────── Bold active / inactive
+```
+
+Formatting is stored in the `.mgf` project file alongside the text. Plain-text `.txt` export strips all formatting. PCL3 export emits the appropriate escape sequences so formatting prints correctly on HP DeskJet and compatible printers.
+
+> **Note:** Ctrl-L is used for italic because Ctrl-I is ASCII 9 (Tab) and cannot be distinguished from it at this level.
+
+## Italic Font
+
+The italic character set is generated at build time by `mkitalic.py` using FreeMonoOblique (or DejaVu Sans Mono Oblique as a fallback). The script renders glyphs for ASCII 0x20–0x7E from the TTF at the correct point size for 8×16 cells, and applies an algorithmic slant to the CP437 special characters (box drawing, Greek, math symbols) that have no TTF equivalent.
+
+To regenerate `deps/thin-vga/font_italic.h`:
+
+```sh
+python3 mkitalic.py > deps/thin-vga/font_italic.h
+# or with an explicit font:
+python3 mkitalic.py /path/to/MyMonoOblique.ttf > deps/thin-vga/font_italic.h
+```
+
+Preview what the generated font looks like before committing:
+
+```sh
+python3 mkitalic.py --preview   # writes italic_preview.png
+```
 
 ## Console
 
@@ -106,18 +153,18 @@ Press `Esc` to open the bottom-row console. Press `Esc` again to close it, or pr
 
 Commands:
 
-| Command | Action |
-|---------|--------|
-| `save` | Save the current file |
-| `save as PATH` | Save using `PATH`'s extension |
-| `scale` | Scale n = 1,2,4 for 1x 2x and 4x scaling |
-| `load PATH` | Load a text or `.mgf` file |
-| `export PATH` | Write print/plain-text output with page macros expanded |
-| `quit` | Quit |
-| `tab N` / `tabs N` | Set tab size and symmetric tab stops |
-| `stops N` | Set page stops to `N` and `79 - N` |
-| `page N` | Set page length in lines |
-| `break` | Insert a page break |
+| Command         | Action                                              |
+|-----------------|-----------------------------------------------------|
+| `save`          | Save the current file                               |
+| `save as PATH`  | Save using `PATH`'s extension                       |
+| `load PATH`     | Load a text or `.mgf` file                          |
+| `export PATH`   | Write print/plain-text output with page macros expanded |
+| `quit`          | Quit                                                |
+| `pb`            | Insert a page break at the cursor                   |
+| `tab N`         | Set tab size and symmetric tab stops                |
+| `stops N`       | Set page stops to `N` and `79 - N`                  |
+| `page N`        | Set page length in lines                            |
+| `scale N`       | Set pixel scaling: 1, 2, or 4                       |
 
 ## Justification
 
@@ -151,30 +198,53 @@ Header and footer text may contain page macros:
 
 ## Page Breaks
 
-Press `Ctrl-B`, or run `break` in the console, to insert an early page break. Macguffin inserts a blue `- break -` marker centered on the center tab, pads the document to the next page boundary, and keeps any repeating header and footer structure in place.
+Run `pb` in the console to insert an early page break. Macguffin inserts a blue `- break -` marker centered on the center tab, pads the document to the next page boundary, and keeps any repeating header and footer structure in place.
 
-The marker is editor metadata. It is saved in `.mgf`, but it does not print or export as text. Plain-text export currently uses LF line endings (`\n`, byte `0x0A`), so the page break becomes however many LF line breaks are needed to reach the next page.
+The marker is editor metadata. It is saved in `.mgf` but does not print or export as text.
 
 ## Files
 
 Macguffin has two save modes:
 
-- `.mgf` project files preserve full Macguffin state: document rows, page length, tab and page stops, and the repeating header and footer templates. Literal `$p` and `$t` are preserved.
-- `.txt` files are print/export output. Page macros are expanded to visible numbers, and the file contains ordinary text rows only.
+- `.mgf` project files preserve full Macguffin state: document rows, per-character rich text attributes, page length, tab and page stops, and the repeating header and footer templates. Literal `$p` and `$t` are preserved.
+- `.txt` files are plain-text export output. Page macros are expanded to visible numbers, formatting is stripped, and the file contains ordinary text rows only.
 
 Use `save as name.mgf` for a project file and `save as name.txt` for plain text. Unknown extensions ask whether to save as an `.mgf` project. `Ctrl-S` on an unnamed file opens a console error prompting `type save as <filename>`.
 
-## Status bar
+### MGF Format
+
+MGF is a simple line-oriented text format. The current version is **MGF5**.
 
 ```
- [new] *             Pg 1  Ln 1  Col 1  10 CPI  INSERT
-  ^filename          ^page ^line ^col   ^fixed  ^mode
+MGF5
+page 66
+stops 0 79 8 72 8
+header 0 <hex>
+footer 0 <hex>
+lines <count>
+<flags> <hex_text>|<hex_fmt>
+...
 ```
-The `*` indicator appears when the file has unsaved changes.
+
+Each line record encodes text and format attributes as paired hex strings separated by `|`. Since text content is hex-encoded, a literal `|` in the document becomes `7C` in the hex stream and is never ambiguous with the separator. Earlier versions (MGF1–MGF4) load cleanly; missing format data defaults to unstyled.
+
+## Status Bar
+
+```
+ [new] *             Pg 1  Ln 1  Col 1  10 CPI  B I U INS
+  ^filename          ^page ^line ^col           ^fmt ^mode
+```
+
+- `*` — unsaved changes
+- `B I U` — Bold / Italic / Underline, bright when active, dim when not
+- `INS` / `OVR` — insert or overwrite mode
 
 ## Roadmap
 
 - [x] Save-as / unnamed-file save flow
 - [x] Explicit page breaks
+- [x] Bold / Italic / Underline rich text
+- [x] MGF5 per-character format storage
+- [x] PCL3 rich text export (escape sequences on format transitions)
 - [ ] Undo / redo
 - [ ] Search / replace

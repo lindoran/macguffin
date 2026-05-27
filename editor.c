@@ -62,6 +62,17 @@
 #include <stdio.h>
 
 /* ------------------------------------------------------------------ */
+/*  Rich text format attribute bits                                    */
+/* ------------------------------------------------------------------ */
+#define FMT_BOLD      0x01
+#define FMT_ITALIC    0x02
+#define FMT_UNDERLINE 0x04
+
+#ifndef __ia16__
+#  include "font_italic.h"
+#endif
+
+/* ------------------------------------------------------------------ */
 /*  Line buffer                                                        */
 /* ------------------------------------------------------------------ */
 #define LINE_INIT  128
@@ -79,9 +90,10 @@
 #define LINE_FLAG_FOOTER     0x04
 
 typedef struct {
-    char *buf;
-    int   len;
-    int   cap;
+    char          *buf; /* character data                        */
+    unsigned char *fmt; /* per-char format attrs (FMT_* bitmask) */
+    int            len;
+    int            cap;
 } Line;
 
 typedef struct {
@@ -116,33 +128,42 @@ static void line_init(Line *l)
 {
     l->cap = LINE_INIT;
     l->buf = (char *)malloc((size_t)l->cap);
+    l->fmt = (unsigned char *)malloc((size_t)l->cap);
     l->buf[0] = '\0';
+    l->fmt[0] = 0;
     l->len = 0;
 }
 
 static void line_free(Line *l)
 {
     free(l->buf);
+    free(l->fmt);
     l->buf = NULL;
+    l->fmt = NULL;
     l->len = l->cap = 0;
 }
 
 static void line_grow(Line *l, int need)
 {
     char *tmp;
+    unsigned char *ftmp;
     if (l->cap == 0) l->cap = LINE_INIT;
     while (l->cap <= need + 1)
         l->cap *= 2;
     tmp = (char *)realloc(l->buf, (size_t)l->cap);
     if (tmp) l->buf = tmp;
+    ftmp = (unsigned char *)realloc(l->fmt, (size_t)l->cap);
+    if (ftmp) l->fmt = ftmp;
 }
 
-static void line_ins(Line *l, int pos, char c)
+static void line_ins(Line *l, int pos, char c, unsigned char f)
 {
     if (pos > l->len) pos = l->len;
     line_grow(l, l->len + 1);
     memmove(l->buf + pos + 1, l->buf + pos, (size_t)(l->len - pos + 1));
+    memmove(l->fmt + pos + 1, l->fmt + pos, (size_t)(l->len - pos));
     l->buf[pos] = c;
+    l->fmt[pos] = f;
     l->len++;
 }
 
@@ -150,8 +171,11 @@ static void line_pad_to(Line *l, int pos)
 {
     if (pos <= l->len) return;
     line_grow(l, pos);
-    while (l->len < pos)
-        l->buf[l->len++] = ' ';
+    while (l->len < pos) {
+        l->buf[l->len] = ' ';
+        l->fmt[l->len] = 0;
+        l->len++;
+    }
     l->buf[l->len] = '\0';
 }
 
@@ -159,6 +183,7 @@ static void line_del(Line *l, int pos)
 {
     if (pos < 0 || pos >= l->len) return;
     memmove(l->buf + pos, l->buf + pos + 1, (size_t)(l->len - pos));
+    memmove(l->fmt + pos, l->fmt + pos + 1, (size_t)(l->len - pos - 1));
     l->len--;
 }
 
@@ -190,6 +215,8 @@ static void split_line(int row, int pos)
     tail = lines[row].len - pos;
     line_grow(&lines[row + 1], tail);
     memcpy(lines[row + 1].buf, lines[row].buf + pos, (size_t)(tail + 1));
+    memcpy(lines[row + 1].fmt, lines[row].fmt + pos, (size_t)tail);
+    lines[row + 1].fmt[tail] = 0;
     lines[row + 1].len = tail;
 
     lines[row].buf[pos] = '\0';
@@ -215,8 +242,10 @@ static void insert_line_copy(int row, const char *buf, int len,
 
     line_init(&lines[row]);
     line_grow(&lines[row], len);
-    if (len > 0)
+    if (len > 0) {
         memcpy(lines[row].buf, buf, (size_t)len);
+        memset(lines[row].fmt, 0, (size_t)len);
+    }
     lines[row].buf[len] = '\0';
     lines[row].len = len;
 }
@@ -231,6 +260,9 @@ static void join_lines(int row)
     memcpy(lines[row].buf + old_len,
            lines[row + 1].buf,
            (size_t)(lines[row + 1].len + 1));
+    memcpy(lines[row].fmt + old_len,
+           lines[row + 1].fmt,
+           (size_t)lines[row + 1].len);
     lines[row].len += lines[row + 1].len;
 
     line_free(&lines[row + 1]);
@@ -248,6 +280,7 @@ static int  cur_row  = 0;
 static int  cur_col  = 0;
 static int  top_row  = 0;
 static int  ins_mode = 1;
+static int  cur_fmt  = 0;   /* active format: FMT_BOLD | FMT_ITALIC | FMT_UNDERLINE */
 static int  modified = 0;
 static int  running  = 1;
 static int  page_len = PCL_LPP;
@@ -498,9 +531,26 @@ static void draw_status(void)
     vio_puts("  Col "); vio_uint(col, 3);
 
     /* Mode and Typeface info */
-    vio_gotoxy(62, VGA_ROWS - 1);
-    vio_puts("10 CPI  ");
-    vio_puts(ins_mode ? "INSERT" : "OVERWRITE");
+    vio_gotoxy(50, VGA_ROWS - 1);
+    vio_puts("10CPI ");
+
+    /* Rich text indicators */
+    vio_setattr(cur_fmt & FMT_BOLD
+                ? VGA_ATTR(VGA_CYAN, VGA_WHITE)
+                : VGA_ATTR(VGA_CYAN, VGA_DGRAY));
+    vio_puts("B");
+    vio_setattr(cur_fmt & FMT_ITALIC
+                ? VGA_ATTR(VGA_CYAN, VGA_WHITE)
+                : VGA_ATTR(VGA_CYAN, VGA_DGRAY));
+    vio_puts("I");
+    vio_setattr(cur_fmt & FMT_UNDERLINE
+                ? VGA_ATTR(VGA_CYAN, VGA_WHITE)
+                : VGA_ATTR(VGA_CYAN, VGA_DGRAY));
+    vio_puts("U");
+
+    vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
+    vio_puts(" ");
+    vio_puts(ins_mode ? "INS" : "OVR");
 
     status_dirty = 0;
 }
@@ -539,13 +589,13 @@ static int line_attr(int lr)
 static void draw_content(void)
 {
     int r;
-    char *txt;
-    int len;
 
     for (r = 0; r < EDIT_ROWS; r++) {
         int lr = top_row + r;
+        int screen_row = r + EDIT_TOP_ROW;
+
         if (lr < 0 || lr >= nlines) {
-            vio_gotoxy(0, r + EDIT_TOP_ROW);
+            vio_gotoxy(0, screen_row);
             vio_setattr(VGA_ATTR_DEFAULT);
             vio_clreol();
             continue;
@@ -553,17 +603,57 @@ static void draw_content(void)
         if (!line_dirty[lr])
             continue;
 
-        txt = lines[lr].buf;
-        len = lines[lr].len;
-        if (len > VGA_COLS) len = VGA_COLS;
+        {
+            int c;
+            int len = lines[lr].len;
+            uint8_t base_attr = (uint8_t)line_attr(lr);
+            int is_special = (line_flags[lr] != 0);
 
-        vio_gotoxy(0, r + EDIT_TOP_ROW);
-        vio_setattr(line_attr(lr));
-        if (len > 0)
-            vio_puts_n(txt, len);
+            if (len > VGA_COLS) len = VGA_COLS;
 
-        if (len < VGA_COLS)
-            vio_clreol();
+#ifndef __ia16__
+            {
+                uint8_t *fplane = vgaterm_fplane(g_vt);
+                uint8_t *uplane = vgaterm_uplane(g_vt);
+                for (c = 0; c < len; c++) {
+                    uint8_t f = is_special ? 0 : lines[lr].fmt[c];
+                    uint8_t attr = base_attr;
+                    uint8_t slot = 0;
+
+                    if (!is_special) {
+                        if (f & FMT_BOLD)
+                            attr = (uint8_t)((attr & 0xF0) | ((attr | 0x08) & 0x0F));
+                        if (f & FMT_ITALIC)
+                            slot = 1;
+                    }
+
+                    vio_putch_at(c, screen_row,
+                                 (uint8_t)lines[lr].buf[c], attr);
+                    if (fplane)
+                        fplane[screen_row * VGA_COLS + c] = slot;
+                    if (uplane)
+                        uplane[screen_row * VGA_COLS + c] =
+                            (!is_special && (f & FMT_UNDERLINE)) ? 1 : 0;
+                }
+                /* clear rest of line */
+                for (c = len; c < VGA_COLS; c++) {
+                    vio_putch_at(c, screen_row, ' ', base_attr);
+                    if (fplane)
+                        fplane[screen_row * VGA_COLS + c] = 0;
+                    if (uplane)
+                        uplane[screen_row * VGA_COLS + c] = 0;
+                }
+            }
+#else
+            /* DOS build: simple attribute-only rendering */
+            vio_gotoxy(0, screen_row);
+            vio_setattr(base_attr);
+            if (len > 0)
+                vio_puts_n(lines[lr].buf, len);
+            if (len < VGA_COLS)
+                vio_clreol();
+#endif
+        }
 
         line_dirty[lr] = 0;
     }
@@ -699,6 +789,12 @@ static int line_from_hex(Line *l, const char *hex)
 
     if (hex_len > 0 && hex[hex_len - 1] == '\n') hex_len--;
     if (hex_len > 0 && hex[hex_len - 1] == '\r') hex_len--;
+    /* stop at '|' (fmt separator) — count only the text portion */
+    {   int j;
+        for (j = 0; j < hex_len; j++) {
+            if (hex[j] == '|') { hex_len = j; break; }
+        }
+    }
     if ((hex_len & 1) != 0)
         return 0;
 
@@ -713,10 +809,83 @@ static int line_from_hex(Line *l, const char *hex)
     }
     l->buf[len] = '\0';
     l->len = len;
+    /* zero fmt for all loaded chars — caller fills from hex if MGF5 */
+    memset(l->fmt, 0, (size_t)len);
     return 1;
 }
 
-static int do_export(const char *path)
+/* Parse the hex fmt section (after '|') into l->fmt.
+ * l->len must already be set correctly by line_from_hex.      */
+static int fmt_from_hex(Line *l, const char *hex)
+{
+    int i, hi, lo;
+    /* skip to '|' */
+    while (*hex && *hex != '|') hex++;
+    if (*hex != '|') return 1;  /* no fmt section — leave zeros */
+    hex++;
+    for (i = 0; i < l->len; i++) {
+        if (!hex[0] || !hex[1]) break;
+        hi = hex_val((unsigned char)hex[0]);
+        lo = hex_val((unsigned char)hex[1]);
+        if (hi < 0 || lo < 0) break;
+        l->fmt[i] = (unsigned char)((hi << 4) | lo);
+        hex += 2;
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  PCL3 rich text export                                              */
+/* ------------------------------------------------------------------ */
+
+/* Emit the minimal PCL escape sequences needed to transition from
+ * prev_fmt to next_fmt.  Only changed bits cause output.             */
+static void pcl_emit_fmt(FILE *f, unsigned char prev, unsigned char next)
+{
+    unsigned char changed = prev ^ next;
+    if (!changed) return;
+
+    if (changed & FMT_BOLD)
+        fputs(next & FMT_BOLD ? "\x1B(s3B" : "\x1B(s0B", f);
+    if (changed & FMT_ITALIC)
+        fputs(next & FMT_ITALIC ? "\x1B(s1S" : "\x1B(s0S", f);
+    if (changed & FMT_UNDERLINE)
+        fputs(next & FMT_UNDERLINE ? "\x1B&d0D" : "\x1B&d@", f);
+}
+
+static void save_line_expanded_pcl(FILE *f, Line *l, int row, int pages)
+{
+    int i;
+    int page = row / page_len + 1;
+    unsigned char cur = 0;
+
+    for (i = 0; i < l->len; i++) {
+        unsigned char f_attr = l->fmt[i];
+
+        /* macro expansion — emit with current fmt state unchanged    */
+        if (l->buf[i] == '$' && i + 1 < l->len) {
+            if (l->buf[i + 1] == 'p') {
+                file_put_uint(f, page);
+                i++;
+                continue;
+            }
+            if (l->buf[i + 1] == 't') {
+                file_put_uint(f, pages);
+                i++;
+                continue;
+            }
+        }
+
+        pcl_emit_fmt(f, cur, f_attr);
+        cur = f_attr;
+        fputc((unsigned char)l->buf[i], f);
+    }
+
+    /* reset all formatting at end of line                            */
+    pcl_emit_fmt(f, cur, 0);
+}
+
+static int do_export_pcl(const char *path)
 {
     FILE *f;
     int i, pages;
@@ -725,10 +894,51 @@ static int do_export(const char *path)
     if (!f) return -1;
 
     pages = total_pages();
+
+    /* PCL3 job header ------------------------------------------------
+     * Reset → portrait → letter → 6 LPI → 10 CPI (Courier)
+     * Left margin at left_page col, text length = page_len lines     */
+    fputs("\x1B" "E", f);                             /* reset             */
+    fputs("\x1B&l0O", f);                          /* portrait          */
+    fputs("\x1B&l2A", f);                          /* letter paper      */
+    fprintf(f, "\x1B&l%dD", PCL_LPI);             /* lines per inch    */
+    fprintf(f, "\x1B(s%dH", PCL_CPI);             /* chars per inch    */
+    fprintf(f, "\x1B&a%dL", tabs.left_page);       /* left margin col   */
+    fprintf(f, "\x1B&l%dF", page_len
+            - (page_header_active ? 1 : 0)
+            - (page_footer_active ? 1 : 0));       /* text length lines */
+
     for (i = 0; i < nlines; i++) {
-        if (!(line_flags[i] & LINE_FLAG_PAGE_BREAK))
+        if (!(line_flags[i] & LINE_FLAG_PAGE_BREAK)) {
+            save_line_expanded_pcl(f, &lines[i], i, pages);
+            if (i < nlines - 1) fputc('\n', f);
+        }
+    }
+
+    /* PCL3 job end */
+    fputs("\x1B" "E", f);
+
+    fclose(f);
+    return 0;
+}
+
+static int do_export(const char *path)
+{
+    FILE *f;
+    int i, pages;
+
+    if (has_ext(path, ".pcl") || has_ext(path, ".prn"))
+        return do_export_pcl(path);
+
+    f = fopen(path, "wb");
+    if (!f) return -1;
+
+    pages = total_pages();
+    for (i = 0; i < nlines; i++) {
+        if (!(line_flags[i] & LINE_FLAG_PAGE_BREAK)) {
             save_line_expanded(f, &lines[i], i, pages);
-        if (i < nlines - 1) fputc('\n', f);
+            if (i < nlines - 1) fputc('\n', f);
+        }
     }
     fclose(f);
 
@@ -743,7 +953,7 @@ static int save_project(const char *path)
     f = fopen(path, "wb");
     if (!f) return -1;
 
-    fprintf(f, "MGF4\n");
+    fprintf(f, "MGF5\n");
     fprintf(f, "page %d\n", page_len);
     fprintf(f, "stops %d %d %d %d %d\n",
             tabs.left_page, tabs.right_page,
@@ -758,6 +968,8 @@ static int save_project(const char *path)
     for (i = 0; i < nlines; i++) {
         fprintf(f, "%u ", (unsigned int)line_flags[i]);
         file_put_hex(f, lines[i].buf, lines[i].len);
+        fputc('|', f);
+        file_put_hex(f, (const char *)lines[i].fmt, lines[i].len);
         fputc('\n', f);
     }
 
@@ -794,6 +1006,8 @@ static int save_as_path(const char *path)
         return save_to_path(path, 1);
     if (has_ext(path, ".txt"))
         return save_to_path(path, 0);
+    if (has_ext(path, ".pcl") || has_ext(path, ".prn"))
+        return do_export(path);
 
     strncpy(console_state.pending_path, path,
             sizeof(console_state.pending_path) - 1);
@@ -918,6 +1132,8 @@ static int load_project(FILE *f, int version)
         }
         if (!line_from_hex(&lines[nlines], hex))
             return -1;
+        if (version >= 5)
+            fmt_from_hex(&lines[nlines], hex);
         nlines++;
     }
 
@@ -952,6 +1168,8 @@ static int do_load(const char *path)
             project_version = 3;
         } else if (strcmp(buf, "MGF4\n") == 0 || strcmp(buf, "MGF4\r\n") == 0) {
             project_version = 4;
+        } else if (strcmp(buf, "MGF5\n") == 0 || strcmp(buf, "MGF5\r\n") == 0) {
+            project_version = 5;
         } else {
             fclose(f);
             return -1;
@@ -1009,8 +1227,11 @@ static void prefix_line_spaces(Line *l, int count)
     if (count <= 0) return;
     line_grow(l, l->len + count);
     memmove(l->buf + count, l->buf, (size_t)(l->len + 1));
-    for (i = 0; i < count; i++)
+    memmove(l->fmt + count, l->fmt, (size_t)l->len);
+    for (i = 0; i < count; i++) {
         l->buf[i] = ' ';
+        l->fmt[i] = 0;
+    }
     l->len += count;
 }
 
@@ -1272,12 +1493,14 @@ static void insert_printable(int ch)
 
     line_pad_to(l, cur_col);
     if (ins_mode) {
-        line_ins(l, cur_col, (char)ch);
+        line_ins(l, cur_col, (char)ch, (unsigned char)cur_fmt);
     } else {
-        if (cur_col < l->len)
+        if (cur_col < l->len) {
             l->buf[cur_col] = (char)ch;
-        else
-            line_ins(l, cur_col, (char)ch);
+            l->fmt[cur_col] = (unsigned char)cur_fmt;
+        } else {
+            line_ins(l, cur_col, (char)ch, (unsigned char)cur_fmt);
+        }
     }
 
     cur_col++;
@@ -1547,6 +1770,8 @@ static void console_execute(void)
     } else if (strcmp(arg, "save") == 0) {
         if (do_save() < 0 && !console_state.has_error)
             set_console_error("save failed");
+    } else if (strcmp(arg, "pb") == 0) {
+        insert_page_break();
     } else if (strncmp(arg, "save as ", 8) == 0) {
         if (save_as_path(arg + 8) < 0 && !console_state.has_error)
             set_console_error("save failed");
@@ -1671,7 +1896,18 @@ static void handle_key(int ch)
         break;
 
     case KEY_CTRL('b'):
-        insert_page_break();
+        cur_fmt ^= FMT_BOLD;
+        status_dirty = 1;
+        break;
+
+    case KEY_CTRL('l'):
+        cur_fmt ^= FMT_ITALIC;
+        status_dirty = 1;
+        break;
+
+    case KEY_CTRL('u'):
+        cur_fmt ^= FMT_UNDERLINE;
+        status_dirty = 1;
         break;
 
     /* Movement ------------------------------------------------------ */
@@ -1874,6 +2110,7 @@ int main(int argc, char *argv[])
         vgaterm_setup_scaling(vt, new_scale);
     vga_scale = new_scale;
     g_vt = vt;
+    vgaterm_set_font_slot(vt, 1, vga_font_italic_8x16);
 #endif
 
     vio_init(vt);
