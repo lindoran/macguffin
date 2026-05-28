@@ -257,4 +257,4 @@ Each line record encodes text and format attributes as paired hex strings separa
 - [x] MGF5 per-character format storage
 - [x] PCL3 rich text export (escape sequences on format transitions)
 - [x] Undo (Ctrl-Z, 512 levels)
-- [ ] Search / replace
+- [x] Search / replace

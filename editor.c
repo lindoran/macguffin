@@ -1895,6 +1895,178 @@ static void command_scale(const char *arg)
 }
 #endif
 
+/* ------------------------------------------------------------------ */
+/*  Find / Replace                                                     */
+/* ------------------------------------------------------------------ */
+
+#define FIND_MAX VGA_COLS
+
+static char last_find[FIND_MAX + 1] = "";
+
+/* Search for term from (start_row, start_col).
+ * Wraps once if needed. Returns 1 on match, 0 if not found.          */
+static int find_from(const char *term, int start_row, int start_col,
+                     int *out_row, int *out_col)
+{
+    int tlen = (int)strlen(term);
+    int pass, r, c, llen;
+
+    if (tlen == 0) return 0;
+
+    for (pass = 0; pass < 2; pass++) {
+        int r_start = (pass == 0) ? start_row : 0;
+        int r_end   = (pass == 0) ? nlines    : start_row + 1;
+
+        for (r = r_start; r < r_end && r < nlines; r++) {
+            llen = lines[r].len;
+            c = (r == r_start && pass == 0) ? start_col : 0;
+            for (; c <= llen - tlen; c++) {
+                if (memcmp(lines[r].buf + c, term, (size_t)tlen) == 0) {
+                    *out_row = r;
+                    *out_col = c;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static void do_find(const char *term)
+{
+    int found_row, found_col;
+
+    if (term && *term) {
+        strncpy(last_find, term, FIND_MAX);
+        last_find[FIND_MAX] = '\0';
+    }
+
+    if (!last_find[0]) {
+        set_console_error("nothing to find");
+        return;
+    }
+
+    /* search from one past cursor so repeated find advances           */
+    if (find_from(last_find, cur_row, cur_col + 1, &found_row, &found_col)) {
+        cur_row = found_row;
+        cur_col = found_col;
+        ensure_visible();
+        mark_visible_dirty();
+        content_dirty = 1;
+        status_dirty  = 1;
+    } else {
+        set_console_error("not found");
+    }
+}
+
+/* Replace chars at (row, col): delete old_len, insert replacement.
+ * Updates cur_row/cur_col to point just past the replacement.        */
+static void replace_at(int row, int col, int old_len, const char *repl)
+{
+    int i, rlen = (int)strlen(repl);
+
+    /* delete old */
+    for (i = 0; i < old_len; i++)
+        line_del(&lines[row], col);
+
+    /* insert replacement with no formatting */
+    for (i = 0; i < rlen; i++)
+        line_ins(&lines[row], col + i, repl[i], 0);
+
+    line_dirty[row] = 1;
+    cur_row = row;
+    cur_col = col + rlen;
+}
+
+/* Parse "old/new" into old and new parts. Returns 1 on success.      */
+static int parse_replace_args(const char *arg,
+                               char *old_buf, int old_max,
+                               char *new_buf, int new_max)
+{
+    const char *sep = strchr(arg, '/');
+    int olen, nlen;
+
+    if (!sep) return 0;
+    olen = (int)(sep - arg);
+    nlen = (int)strlen(sep + 1);
+
+    if (olen <= 0 || olen >= old_max || nlen >= new_max) return 0;
+
+    memcpy(old_buf, arg, (size_t)olen);
+    old_buf[olen] = '\0';
+    memcpy(new_buf, sep + 1, (size_t)nlen);
+    new_buf[nlen] = '\0';
+    return 1;
+}
+
+static void do_replace(const char *arg)
+{
+    char old_buf[FIND_MAX + 1], new_buf[FIND_MAX + 1];
+    int found_row, found_col;
+
+    if (!parse_replace_args(arg, old_buf, sizeof(old_buf),
+                                  new_buf, sizeof(new_buf))) {
+        set_console_error("usage: replace old/new");
+        return;
+    }
+
+    strncpy(last_find, old_buf, FIND_MAX);
+    last_find[FIND_MAX] = '\0';
+
+    if (!find_from(old_buf, cur_row, cur_col, &found_row, &found_col)) {
+        set_console_error("not found");
+        return;
+    }
+
+    replace_at(found_row, found_col, (int)strlen(old_buf), new_buf);
+    modified = 1;
+    content_dirty = 1;
+    status_dirty  = 1;
+    ensure_visible();
+}
+
+static void do_replace_all(const char *arg)
+{
+    char old_buf[FIND_MAX + 1], new_buf[FIND_MAX + 1];
+    int found_row, found_col;
+    int count = 0;
+    int search_row = 0, search_col = 0;
+
+    if (!parse_replace_args(arg, old_buf, sizeof(old_buf),
+                                  new_buf, sizeof(new_buf))) {
+        set_console_error("usage: replace all old/new");
+        return;
+    }
+
+    strncpy(last_find, old_buf, FIND_MAX);
+    last_find[FIND_MAX] = '\0';
+
+    while (find_from(old_buf, search_row, search_col,
+                     &found_row, &found_col)) {
+        replace_at(found_row, found_col, (int)strlen(old_buf), new_buf);
+        /* advance past replacement to avoid infinite loop             */
+        search_row = found_row;
+        search_col = found_col + (int)strlen(new_buf);
+        if (search_col > lines[search_row].len) {
+            search_row++;
+            search_col = 0;
+            if (search_row >= nlines) break;
+        }
+        count++;
+        if (count > MAX_LINES * VGA_COLS) break; /* safety cap        */
+    }
+
+    if (count == 0) {
+        set_console_error("not found");
+    } else {
+        modified = 1;
+        mark_visible_dirty();
+        status_dirty  = 1;
+        content_dirty = 1;
+        ensure_visible();
+    }
+}
+
 static void console_execute(void)
 {
     char cmd[80];
@@ -1933,6 +2105,14 @@ static void console_execute(void)
             console_state.saved_row = cur_row;
             console_state.saved_col = cur_col;
         }
+    } else if (strncmp(arg, "find ", 5) == 0) {
+        do_find(arg + 5);
+    } else if (strcmp(arg, "find") == 0 || strcmp(arg, "f") == 0) {
+        do_find(NULL);
+    } else if (strncmp(arg, "replace all ", 12) == 0) {
+        do_replace_all(arg + 12);
+    } else if (strncmp(arg, "replace ", 8) == 0) {
+        do_replace(arg + 8);
     } else if (strcmp(arg, "quit") == 0) {
         running = 0;
 #ifndef __ia16__
@@ -2045,6 +2225,10 @@ static void handle_key(int ch)
 
     case KEY_CTRL('z'):
         do_undo();
+        break;
+
+    case KEY_CTRL('g'):
+        do_find(NULL);
         break;
 
     case KEY_CTRL('b'):
@@ -2191,6 +2375,7 @@ static void handle_key(int ch)
             undo_push_join(cur_row - 1, prev_len);
             join_lines(cur_row - 1);
             line_dirty[cur_row - 1] = 1;
+            mark_visible_dirty();
             modified = 1;
             cur_row--;
             cur_col = prev_len;
@@ -2213,6 +2398,7 @@ static void handle_key(int ch)
             undo_push_join(cur_row, lines[cur_row].len);
             join_lines(cur_row);
             line_dirty[cur_row] = 1;
+            mark_visible_dirty();
             modified = 1;
             content_dirty = 1;
             status_dirty = 1;
