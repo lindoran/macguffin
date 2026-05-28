@@ -1,11 +1,10 @@
 # Macguffin
 
-A tiny, deterministic CP437 text editor for modern Linux and vintage DOS.
+A tiny, deterministic CP437 text editor for modern Linux.
 
 Built on the **thin-vga** stack. No SDL, no ncurses, no complex abstractions. Just a raw 4000-byte VGA text buffer and direct hardware access.
 
-- **Linux / X11** — Renders directly via Xlib using an authentic 8×16 VGA bitmap font.
-- **DOS / ia16** — Runs in native 16-bit real mode. Writes directly to `$B800` with optimized cursor sync for zero-latency feedback and minimal flicker.
+Macguffin renders directly via Xlib using an authentic 8×16 VGA bitmap font.
 
 ## Why Macguffin?
 
@@ -23,12 +22,10 @@ This editor treats the screen as a flat memory buffer (`character` + `attribute`
 
 - **Resolution:** 80×25 characters.
 - **Colors:** 16-color CGA/VGA palette.
-- **Font:** Genuine IBM VGA 8×16 bitmap (built-in for Linux, native for DOS). A matching italic variant is generated from the same bitmap by `mkitalic.py` — no external fonts required.
+- **Font:** Genuine IBM VGA 8×16 bitmap. A matching italic variant is generated from the same bitmap by `mkitalic.py` — no external fonts required.
 - **Efficiency:** The entire I/O layer is very small, stays out of the way and assures Macguffin won't bind up even on tiny hardware.
 
 ## Dependencies
-
-### Linux / X11
 
 - `libX11` development libraries.
 
@@ -39,16 +36,10 @@ sudo pacman -S libx11           # Arch
 
 `python3-pillow` is optional — only needed if you want to render `italic_preview.png` via `mkitalic.py --preview`.
 
-### DOS target
-
-- [ia16-elf-gcc](https://github.com/tkchia/build-ia16) toolchain.
-- `libi86` for DOS/BIOS interrupt support.
-
 ## Build
 
 ```sh
-make          # Linux binary -> ./editor
-make dos      # DOS binary   -> ./editor.com
+make          # build ./editor
 ```
 
 Pass a filename as the first argument to open a file on startup:

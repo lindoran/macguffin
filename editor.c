@@ -4,62 +4,16 @@
  * Deterministic, fixed-geometry 80x25 text mode.
  */
 
-#ifdef __ia16__
-#  include <i86.h>
-#  include <conio.h>
-#  include <dos.h>
-#  include <bios.h>
-#  define MAX_LINES  2048
-#  define LOAD_BUF   256
-#  define VGA_ROWS   25
-#  define VGA_COLS   80
+#include "vgaterm.h"
+#include "vio.h"
 
-#  define VGA_BLACK         0
-#  define VGA_BLUE          1
-#  define VGA_GREEN         2
-#  define VGA_CYAN          3
-#  define VGA_RED           4
-#  define VGA_MAGENTA       5
-#  define VGA_BROWN         6
-#  define VGA_LGRAY         7
-#  define VGA_DGRAY         8
-#  define VGA_LBLUE         9
-#  define VGA_LGREEN       10
-#  define VGA_LCYAN        11
-#  define VGA_LRED         12
-#  define VGA_LMAGENTA     13
-#  define VGA_YELLOW       14
-#  define VGA_WHITE        15
-
-#  define VGA_ATTR(bg, fg) (unsigned char)(((bg) & 0x0F) << 4 | ((fg) & 0x0F))
-#  define VGA_ATTR_DEFAULT VGA_ATTR(VGA_BLACK, VGA_LGRAY)
-#  define KEY_CTRL(c) ((c) & 0x1F)
-#  define KEY_BS     0x08
-#  define KEY_ENTER  0x0D
-#  define KEY_TAB    0x09
-#  define KEY_ESC    0x1B
-#  define KEY_UP     0x4800
-#  define KEY_DOWN   0x5000
-#  define KEY_LEFT   0x4B00
-#  define KEY_RIGHT  0x4D00
-#  define KEY_HOME   0x4700
-#  define KEY_END    0x4F00
-#  define KEY_PGUP   0x4900
-#  define KEY_PGDN   0x5100
-#  define KEY_INS    0x5200
-#  define KEY_DEL    0x5300
-#  define KEY_NONE   -2
-#  define KEY_CLOSED -1
-#else
-#  include "vgaterm.h"
-#  include "vio.h"
-#  define MAX_LINES  65536
-#  define LOAD_BUF   4096
-#endif
+#define MAX_LINES  65536
+#define LOAD_BUF   4096
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /*  Rich text format attribute bits                                    */
@@ -68,9 +22,7 @@
 #define FMT_ITALIC    0x02
 #define FMT_UNDERLINE 0x04
 
-#ifndef __ia16__
-#  include "font_italic.h"
-#endif
+#include "font_italic.h"
 
 /* ------------------------------------------------------------------ */
 /*  Line buffer                                                        */
@@ -121,14 +73,24 @@ static Line lines[MAX_LINES];
 static int  nlines = 1;
 static unsigned char line_flags[MAX_LINES];
 
+static void mark_visible_dirty(void);
+
 /* ------------------------------------------------------------------ */
 /*  Line helpers                                                       */
 /* ------------------------------------------------------------------ */
+static void die_oom(void)
+{
+    fputs("macguffin: out of memory\n", stderr);
+    exit(1);
+}
+
 static void line_init(Line *l)
 {
     l->cap = LINE_INIT;
     l->buf = (char *)malloc((size_t)l->cap);
     l->fmt = (unsigned char *)malloc((size_t)l->cap);
+    if (!l->buf || !l->fmt)
+        die_oom();
     l->buf[0] = '\0';
     l->fmt[0] = 0;
     l->len = 0;
@@ -151,9 +113,13 @@ static void line_grow(Line *l, int need)
     while (l->cap <= need + 1)
         l->cap *= 2;
     tmp = (char *)realloc(l->buf, (size_t)l->cap);
-    if (tmp) l->buf = tmp;
+    if (!tmp)
+        die_oom();
+    l->buf = tmp;
     ftmp = (unsigned char *)realloc(l->fmt, (size_t)l->cap);
-    if (ftmp) l->fmt = ftmp;
+    if (!ftmp)
+        die_oom();
+    l->fmt = ftmp;
 }
 
 static void line_ins(Line *l, int pos, char c, unsigned char f)
@@ -221,6 +187,7 @@ static void split_line(int row, int pos)
 
     lines[row].buf[pos] = '\0';
     lines[row].len = pos;
+    mark_visible_dirty();
 }
 
 static void insert_line_copy(int row, const char *buf, int len,
@@ -248,6 +215,7 @@ static void insert_line_copy(int row, const char *buf, int len,
     }
     lines[row].buf[len] = '\0';
     lines[row].len = len;
+    mark_visible_dirty();
 }
 
 static void join_lines(int row)
@@ -271,6 +239,7 @@ static void join_lines(int row)
         line_flags[i] = line_flags[i + 1];
     }
     nlines--;
+    mark_visible_dirty();
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,10 +263,8 @@ static int ruler_dirty   = 1;
 static TabStops tabs;
 static Console console_state;
 
-#ifndef __ia16__
 static VGATerm *g_vt     = NULL; /* set after vgaterm_open; used by command_scale */
 static int      vga_scale = 1;   /* current scaling: 1, 2, or 4                   */
-#endif
 static char page_header[PAGE_HEADER_MAX + 1];
 static int  page_header_len = 0;
 static int  page_header_active = 0;
@@ -305,90 +272,6 @@ static int  page_header_active = 0;
 static char page_footer[PAGE_HEADER_MAX + 1];
 static int  page_footer_len = 0;
 static int  page_footer_active = 0;
-
-#ifdef __ia16__
-/* --- DOS VIO Stubs --- */
-static int s_attr = VGA_ATTR_DEFAULT;
-static int s_col = 0, s_row = 0;
-
-static void vio_gotoxy(int col, int row) {
-    s_col = col; s_row = row;
-}
-
-static void vio_setattr(int attr) { s_attr = attr; }
-
-static void vio_putch(unsigned char ch) {
-    unsigned char __far *vga = (unsigned char __far *)0xB8000000L;
-    int off = (s_row * 80 + s_col) * 2;
-    vga[off] = ch;
-    vga[off+1] = (unsigned char)s_attr;
-    if (s_col < 79) s_col++;
-}
-
-static void vio_puts(const char *s) {
-    while (*s) vio_putch((unsigned char)*s++);
-}
-
-static void vio_puts_n(const char *s, int n) {
-    int i;
-    for (i = 0; i < n; i++) {
-        vio_putch(s[i] ? (unsigned char)s[i] : ' ');
-        if (!s[i]) s = "";
-    }
-}
-
-static void vio_clreol(void) {
-    int c, old_col = s_col;
-    for (c = s_col; c < 80; c++) vio_putch(' ');
-    vio_gotoxy(old_col, s_row);
-}
-
-static void vio_clrline(int row, int attr) {
-    int c;
-    int old_attr = s_attr;
-    vio_gotoxy(0, row);
-    vio_setattr(attr);
-    for (c = 0; c < 80; c++) vio_putch(' ');
-    vio_setattr(old_attr);
-}
-
-static void vio_clrscr(void) {
-    int r;
-    for (r = 0; r < 25; r++) vio_clrline(r, s_attr);
-    vio_gotoxy(0, 0);
-}
-
-static void vio_uint(unsigned int n, int width) {
-    char buf[10];
-    int i = 0;
-    if (n == 0) buf[i++] = '0';
-    while (n > 0) { buf[i++] = (char)('0' + (n % 10)); n /= 10; }
-    while (width > i) { vio_putch(' '); width--; }
-    while (i > 0) vio_putch((unsigned char)buf[--i]);
-}
-
-static void vio_show_cursor(void) {
-    union REGS r;
-    r.h.ah = 0x02; r.h.bh = 0;
-    r.h.dh = (unsigned char)s_row; r.h.dl = (unsigned char)s_col;
-    int86(0x10, &r, &r);
-}
-static void vio_flush(void) { }
-static void vio_init(void *vt) { (void)vt; }
-static void vio_fini(void) { }
-
-static int vio_getch(void) {
-    unsigned short k = _bios_keybrd(_KEYBRD_READ);
-    if ((k & 0xFF) != 0) return (int)(k & 0xFF);
-    return (int)(k & 0xFF00);
-}
-
-static int vio_kbhit(void) {
-    unsigned short k = _bios_keybrd(_KEYBRD_READY);
-    if (k == 0) return KEY_NONE;
-    return vio_getch();
-}
-#endif
 
 #define EDIT_TOP_ROW 1
 #define EDIT_ROWS (VGA_ROWS - 2)
@@ -752,7 +635,6 @@ static void draw_content(void)
 
             if (len > VGA_COLS) len = VGA_COLS;
 
-#ifndef __ia16__
             {
                 uint8_t *fplane = vgaterm_fplane(g_vt);
                 uint8_t *uplane = vgaterm_uplane(g_vt);
@@ -785,15 +667,6 @@ static void draw_content(void)
                         uplane[screen_row * VGA_COLS + c] = 0;
                 }
             }
-#else
-            /* DOS build: simple attribute-only rendering */
-            vio_gotoxy(0, screen_row);
-            vio_setattr(base_attr);
-            if (len > 0)
-                vio_puts_n(lines[lr].buf, len);
-            if (len < VGA_COLS)
-                vio_clreol();
-#endif
         }
 
         line_dirty[lr] = 0;
@@ -1182,7 +1055,8 @@ static int load_project(FILE *f, int version)
 
     if (!fgets(buf, (int)sizeof(buf), f))
         return -1;
-    if (sscanf(buf, "page %d", &page_len) != 1 || page_len < 2)
+    if (sscanf(buf, "page %d", &page_len) != 1 ||
+        page_len < 2 || page_len > MAX_LINES)
         return -1;
 
     if (version >= 3) {
@@ -1256,10 +1130,12 @@ static int load_project(FILE *f, int version)
     nlines = 0;
     for (i = 0; i < count; i++) {
         char *hex = buf;
+        int idx;
         if (!fgets(buf, (int)sizeof(buf), f))
             return -1;
         line_init(&lines[nlines]);
-        line_flags[nlines] = 0;
+        idx = nlines++;
+        line_flags[idx] = 0;
         if (version >= 2) {
             unsigned int flags = 0;
             while (*hex >= '0' && *hex <= '9') {
@@ -1269,13 +1145,12 @@ static int load_project(FILE *f, int version)
             if (*hex != ' ')
                 return -1;
             hex++;
-            line_flags[nlines] = (unsigned char)flags;
+            line_flags[idx] = (unsigned char)flags;
         }
-        if (!line_from_hex(&lines[nlines], hex))
+        if (!line_from_hex(&lines[idx], hex))
             return -1;
         if (version >= 5)
-            fmt_from_hex(&lines[nlines], hex);
-        nlines++;
+            fmt_from_hex(&lines[idx], hex);
     }
 
     if (nlines == 0) {
@@ -1327,9 +1202,11 @@ static int do_load(const char *path)
     if (project) {
         if (load_project(f, project_version) != 0) {
             fclose(f);
+            reset_editor();
             return -1;
         }
     } else {
+        line_free(&lines[0]);
         nlines = 0;
 
         while (fgets(buf, (int)sizeof(buf), f)) {
@@ -1340,6 +1217,7 @@ static int do_load(const char *path)
             line_init(&lines[nlines]);
             line_grow(&lines[nlines], len);
             memcpy(lines[nlines].buf, buf, (size_t)(len + 1));
+            memset(lines[nlines].fmt, 0, (size_t)len);
             lines[nlines].len = len;
             line_flags[nlines] = 0;
             nlines++;
@@ -1447,7 +1325,9 @@ static void move_to_header(void)
     int  tmp_len;
 
     if (cur_row == page_start) {
-        line_flags[cur_row] = (line_flags[cur_row] & ~LINE_FLAG_FOOTER) | LINE_FLAG_REPEAT;
+        line_flags[cur_row] =
+            (unsigned char)((line_flags[cur_row] & (unsigned char)~LINE_FLAG_FOOTER) |
+                            LINE_FLAG_REPEAT);
         line_dirty[cur_row] = 1;
         modified = 1;
         status_dirty = 1;
@@ -1479,7 +1359,9 @@ static void move_to_footer(void)
     if (page_end >= nlines) page_end = nlines - 1;
 
     if (cur_row == page_end) {
-        line_flags[cur_row] = (line_flags[cur_row] & ~LINE_FLAG_REPEAT) | LINE_FLAG_FOOTER;
+        line_flags[cur_row] =
+            (unsigned char)((line_flags[cur_row] & (unsigned char)~LINE_FLAG_REPEAT) |
+                            LINE_FLAG_FOOTER);
         line_dirty[cur_row] = 1;
         modified = 1;
         status_dirty = 1;
@@ -1554,7 +1436,7 @@ static void insert_page_break(void)
     int marker_len;
     int row;
 
-    if (nlines >= MAX_LINES)
+    if (nlines > MAX_LINES - 2)
         return;
 
     split_line(cur_row, cur_col);
@@ -1571,6 +1453,8 @@ static void insert_page_break(void)
         row++;
     }
 
+    if (row >= nlines)
+        row = nlines - 1;
     cur_row = row;
     reserve_page_footer_if_needed();
     reserve_page_header_if_needed();
@@ -1790,8 +1674,12 @@ static int parse_uint(const char *s, int *out)
 
     if (!*s) return 0;
     while (*s) {
+        int digit;
         if (*s < '0' || *s > '9') return 0;
-        n = n * 10 + (*s - '0');
+        digit = *s - '0';
+        if (n > (INT_MAX - digit) / 10)
+            return 0;
+        n = n * 10 + digit;
         s++;
     }
     *out = n;
@@ -1853,7 +1741,7 @@ static void command_page(const char *arg)
 {
     int n;
 
-    if (!parse_uint(arg, &n) || n < 2) {
+    if (!parse_uint(arg, &n) || n < 2 || n > MAX_LINES) {
         set_console_error("page needs a number greater than 1");
         return;
     }
@@ -1883,7 +1771,6 @@ static void handle_pending_save_as(int ch)
     }
 }
 
-#ifndef __ia16__
 static void command_scale(const char *arg)
 {
     int n = 0;
@@ -1901,7 +1788,6 @@ static void command_scale(const char *arg)
     ruler_dirty  = 1;
     status_dirty = 1;
 }
-#endif
 
 /* ------------------------------------------------------------------ */
 /*  Find / Replace                                                     */
@@ -2072,6 +1958,8 @@ static void do_replace(const char *arg)
     }
 
     replace_at(found_row, found_col, (int)strlen(old_buf), new_buf);
+    console_state.saved_row = cur_row;
+    console_state.saved_col = cur_col;
     modified = 1;
     content_dirty = 1;
     status_dirty  = 1;
@@ -2112,6 +2000,8 @@ static void do_replace_all(const char *arg)
     if (count == 0) {
         set_console_error("not found");
     } else {
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
         modified = 1;
         mark_visible_dirty();
         status_dirty  = 1;
@@ -2150,11 +2040,15 @@ static void console_execute(void)
         repeat_current_row();
     } else if (strcmp(arg, "break") == 0) {
         insert_page_break();
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
     } else if (strcmp(arg, "save") == 0) {
         if (do_save() < 0 && !console_state.has_error)
             set_console_error("save failed");
     } else if (strcmp(arg, "pb") == 0) {
         insert_page_break();
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
     } else if (strncmp(arg, "save as ", 8) == 0) {
         if (save_as_path(arg + 8) < 0 && !console_state.has_error)
             set_console_error("save failed");
@@ -2178,10 +2072,8 @@ static void console_execute(void)
         do_replace(arg + 8);
     } else if (strcmp(arg, "quit") == 0) {
         running = 0;
-#ifndef __ia16__
     } else if (strncmp(arg, "scale ", 6) == 0) {
         command_scale(arg + 6);
-#endif
     } else if (arg[0] == '\0') {
         console_exit();
     } else {
@@ -2406,13 +2298,17 @@ static void handle_key(int ch)
 
     /* Newline -------------------------------------------------------- */
     case KEY_ENTER:
+        if (nlines >= MAX_LINES) {
+            set_console_error("maximum lines reached");
+            break;
+        }
         undo_push_split();
         split_line(cur_row, cur_col);
         line_dirty[cur_row] = 1;
         line_dirty[cur_row + 1] = 1;
         cur_row++;
         reserve_page_footer_if_needed();
-    reserve_page_header_if_needed();
+        reserve_page_header_if_needed();
         prefix_line_spaces(&lines[cur_row], tabs.left_tab);
         cur_col = tabs.left_tab;
         modified = 1;
@@ -2481,10 +2377,6 @@ static void handle_key(int ch)
 }
 }
 
-#ifdef __ia16__
-typedef void VGATerm;
-#endif
-
 /* ------------------------------------------------------------------ */
 /*  Entry point                                                        */
 /* ------------------------------------------------------------------ */
@@ -2492,14 +2384,11 @@ int main(int argc, char *argv[])
 {
     int ch;
     VGATerm *vt = NULL;
-#ifndef __ia16__
     int i;
     int new_scale;
     int n_scale;
     const char *load_file;
-#endif
 
-#ifndef __ia16__
     new_scale = 1;
     load_file = NULL;
 
@@ -2521,7 +2410,6 @@ int main(int argc, char *argv[])
     vga_scale = new_scale;
     g_vt = vt;
     vgaterm_set_font_slot(vt, 1, vga_font_italic_8x16);
-#endif
 
     vio_init(vt);
     vio_setattr(VGA_ATTR_DEFAULT);
@@ -2532,9 +2420,6 @@ int main(int argc, char *argv[])
 
     line_init(&lines[0]);
     cur_col = tabs.left_tab;
-#ifdef __ia16__
-    if (argc > 1) do_load(argv[1]);
-#else
     if (load_file) {
         if (has_ext(load_file, ".pcl") || has_ext(load_file, ".prn")) {
             /* output-only format: set as save target, don't load */
@@ -2545,7 +2430,6 @@ int main(int argc, char *argv[])
             do_load(load_file);
         }
     }
-#endif
 
     ensure_visible();
 
@@ -2591,8 +2475,6 @@ int main(int argc, char *argv[])
     }
 
     vio_fini();
-#ifndef __ia16__
     vgaterm_close(vt);
-#endif
     return 0;
 }

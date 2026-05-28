@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------
-#  Makefile -- macguffin against thin-vga + ia16 DOS support
+#  Makefile -- macguffin against thin-vga
 # ---------------------------------------------------------------
 
 VGADIR  = deps/thin-vga
@@ -9,15 +9,9 @@ LDFLAGS = -lX11 -lm
 SRCS = editor.c $(VGADIR)/vgaterm.c $(VGADIR)/vio.c
 OBJS = editor.o vgaterm.o vio.o
 
-# --- DOS / ia16 ------------------------------------------------
-CC_DOS     = ia16-elf-gcc
-CFLAGS_DOS  = -O2 -Wall -Wextra -mcmodel=small -march=i8086 -li86
-
-.PHONY: all dos run clean
+.PHONY: all run clean
 
 all: editor
-
-dos: editor.com
 
 editor: $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -34,12 +28,8 @@ vio.o: $(VGADIR)/vio.c $(VGADIR)/vio.h $(VGADIR)/vgaterm.h
 $(VGADIR)/font_vga.h:
 	$(MAKE) -C $(VGADIR) font_vga.h
 
-# --- DOS build -------------------------------------------------
-editor.com: editor.c
-	$(CC_DOS) -O2 -Wall -Wextra -mcmodel=small -march=i8086 -o $@ $< -li86
-
 run: editor
 	./editor
 
 clean:
-	rm -f editor editor.com *.o
+	rm -f editor *.o
