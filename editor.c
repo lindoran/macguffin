@@ -484,6 +484,147 @@ static void ensure_visible(void)
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Undo system                                                        */
+/* ------------------------------------------------------------------ */
+
+#define UNDO_MAX 512
+
+typedef enum {
+    UNDO_INS_CHAR,  /* undo: delete char at (row,col)              */
+    UNDO_DEL_CHAR,  /* undo: insert char ch/fmt at (row,col)       */
+    UNDO_SPLIT,     /* undo: join lines[row] and lines[row+1]      */
+    UNDO_JOIN       /* undo: split lines[row] at col               */
+} UndoType;
+
+typedef struct {
+    UndoType      type;
+    int           row, col;
+    char          ch;
+    unsigned char fmt_byte;
+    char          line_buf[VGA_COLS + 1];
+    unsigned char line_fmt[VGA_COLS];
+    int           line_len;
+} UndoRecord;
+
+static UndoRecord undo_stack[UNDO_MAX];
+static int        undo_top   = 0;
+static int        undo_count = 0;
+
+static UndoRecord *undo_push(void)
+{
+    UndoRecord *r = &undo_stack[undo_top];
+    undo_top = (undo_top + 1) % UNDO_MAX;
+    if (undo_count < UNDO_MAX) undo_count++;
+    return r;
+}
+
+static void undo_push_ins_char(void)
+{
+    UndoRecord *r = undo_push();
+    r->type = UNDO_INS_CHAR;
+    r->row  = cur_row;
+    r->col  = cur_col;
+}
+
+static void undo_push_del_char(int row, int col)
+{
+    UndoRecord *r = undo_push();
+    r->type     = UNDO_DEL_CHAR;
+    r->row      = row;
+    r->col      = col;
+    r->ch       = lines[row].buf[col];
+    r->fmt_byte = lines[row].fmt[col];
+}
+
+static void undo_push_split(void)
+{
+    UndoRecord *r = undo_push();
+    r->type = UNDO_SPLIT;
+    r->row  = cur_row;
+    r->col  = cur_col;
+}
+
+static void undo_push_join(int row, int split_col)
+{
+    UndoRecord *r  = undo_push();
+    Line       *l1 = &lines[row + 1];
+    int         tail = l1->len < VGA_COLS ? l1->len : VGA_COLS;
+    r->type     = UNDO_JOIN;
+    r->row      = row;
+    r->col      = split_col;
+    r->line_len = tail;
+    memcpy(r->line_buf, l1->buf, (size_t)tail);
+    r->line_buf[tail] = '\0';
+    memcpy(r->line_fmt, l1->fmt, (size_t)tail);
+}
+
+static void do_undo(void)
+{
+    UndoRecord *r;
+
+    if (undo_count == 0) {
+        set_console_error("nothing to undo");
+        return;
+    }
+
+    undo_top = (undo_top - 1 + UNDO_MAX) % UNDO_MAX;
+    undo_count--;
+    r = &undo_stack[undo_top];
+
+    switch (r->type) {
+
+    case UNDO_INS_CHAR:
+        cur_row = r->row;
+        cur_col = r->col;
+        if (cur_col < lines[cur_row].len) {
+            line_del(&lines[cur_row], cur_col);
+            line_dirty[cur_row] = 1;
+        }
+        break;
+
+    case UNDO_DEL_CHAR:
+        cur_row = r->row;
+        cur_col = r->col;
+        line_ins(&lines[cur_row], cur_col, r->ch, r->fmt_byte);
+        line_dirty[cur_row] = 1;
+        break;
+
+    case UNDO_SPLIT:
+        cur_row = r->row;
+        cur_col = r->col;
+        if (cur_row + 1 < nlines) {
+            join_lines(cur_row);
+            line_dirty[cur_row] = 1;
+            mark_visible_dirty();
+        }
+        break;
+
+    case UNDO_JOIN:
+        cur_row = r->row;
+        cur_col = r->col;
+        split_line(cur_row, r->col);
+        if (cur_row + 1 < nlines) {
+            Line *l = &lines[cur_row + 1];
+            line_grow(l, r->line_len);
+            memcpy(l->buf, r->line_buf, (size_t)r->line_len);
+            l->buf[r->line_len] = '\0';
+            memcpy(l->fmt, r->line_fmt, (size_t)r->line_len);
+            l->len = r->line_len;
+            line_dirty[cur_row + 1] = 1;
+        }
+        line_dirty[cur_row] = 1;
+        mark_visible_dirty();
+        break;
+    }
+
+    modified      = 1;
+    status_dirty  = 1;
+    content_dirty = 1;
+    ensure_visible();
+}
+
 /* ------------------------------------------------------------------ */
 /*  Drawing                                                            */
 /* ------------------------------------------------------------------ */
@@ -1152,6 +1293,12 @@ static int do_load(const char *path)
     int project = has_ext(path, ".mgf");
     int project_version = 0;
 
+    /* PCL/PRN are output-only formats — loading them is not supported */
+    if (has_ext(path, ".pcl") || has_ext(path, ".prn")) {
+        set_console_error("pcl/prn files cannot be loaded — use export");
+        return -1;
+    }
+
     f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -1492,6 +1639,7 @@ static void insert_printable(int ch)
         cur_col = tabs.right_page + 1;
 
     line_pad_to(l, cur_col);
+    undo_push_ins_char();
     if (ins_mode) {
         line_ins(l, cur_col, (char)ch, (unsigned char)cur_fmt);
     } else {
@@ -1895,6 +2043,10 @@ static void handle_key(int ch)
         repeat_current_row();
         break;
 
+    case KEY_CTRL('z'):
+        do_undo();
+        break;
+
     case KEY_CTRL('b'):
         cur_fmt ^= FMT_BOLD;
         status_dirty = 1;
@@ -2003,6 +2155,7 @@ static void handle_key(int ch)
 
     /* Newline -------------------------------------------------------- */
     case KEY_ENTER:
+        undo_push_split();
         split_line(cur_row, cur_col);
         line_dirty[cur_row] = 1;
         line_dirty[cur_row + 1] = 1;
@@ -2026,6 +2179,7 @@ static void handle_key(int ch)
     /* Backspace ------------------------------------------------------ */
     case KEY_BS:
         if (cur_col > 0) {
+            undo_push_del_char(cur_row, cur_col - 1);
             cur_col--;
             line_del(&lines[cur_row], cur_col);
             line_dirty[cur_row] = 1;
@@ -2034,6 +2188,7 @@ static void handle_key(int ch)
             status_dirty = 1;
         } else if (cur_row > 0) {
             int prev_len = lines[cur_row - 1].len;
+            undo_push_join(cur_row - 1, prev_len);
             join_lines(cur_row - 1);
             line_dirty[cur_row - 1] = 1;
             modified = 1;
@@ -2048,12 +2203,14 @@ static void handle_key(int ch)
     /* Delete --------------------------------------------------------- */
     case KEY_DEL:
         if (cur_col < lines[cur_row].len) {
+            undo_push_del_char(cur_row, cur_col);
             line_del(&lines[cur_row], cur_col);
             line_dirty[cur_row] = 1;
             modified = 1;
             content_dirty = 1;
             status_dirty = 1;
         } else if (cur_row < nlines - 1) {
+            undo_push_join(cur_row, lines[cur_row].len);
             join_lines(cur_row);
             line_dirty[cur_row] = 1;
             modified = 1;
@@ -2125,7 +2282,16 @@ int main(int argc, char *argv[])
 #ifdef __ia16__
     if (argc > 1) do_load(argv[1]);
 #else
-    if (load_file) do_load(load_file);
+    if (load_file) {
+        if (has_ext(load_file, ".pcl") || has_ext(load_file, ".prn")) {
+            /* output-only format: set as save target, don't load */
+            strncpy(fname, load_file, sizeof(fname) - 1);
+            fname[sizeof(fname) - 1] = '\0';
+            status_dirty = 1;
+        } else {
+            do_load(load_file);
+        }
+    }
 #endif
 
     ensure_visible();

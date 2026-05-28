@@ -23,7 +23,7 @@ This editor treats the screen as a flat memory buffer (`character` + `attribute`
 
 - **Resolution:** 80×25 characters.
 - **Colors:** 16-color CGA/VGA palette.
-- **Font:** Genuine IBM VGA 8×16 bitmap (built-in for Linux, native for DOS).  A second italic font slot is generated at build time from FreeMonoOblique via `mkitalic.py`.
+- **Font:** Genuine IBM VGA 8×16 bitmap (built-in for Linux, native for DOS). A matching italic variant is generated from the same bitmap by `mkitalic.py` — no external fonts required.
 - **Efficiency:** The entire I/O layer is very small, stays out of the way and assures Macguffin won't bind up even on tiny hardware.
 
 ## Dependencies
@@ -31,12 +31,13 @@ This editor treats the screen as a flat memory buffer (`character` + `attribute`
 ### Linux / X11
 
 - `libX11` development libraries.
-- `python3-pillow` for italic font generation.
 
 ```sh
-sudo apt install libx11-dev python3-pillow     # Debian/Ubuntu
-sudo pacman -S libx11 python-pillow            # Arch
+sudo apt install libx11-dev     # Debian/Ubuntu
+sudo pacman -S libx11           # Arch
 ```
+
+`python3-pillow` is optional — only needed if you want to render `italic_preview.png` via `mkitalic.py --preview`.
 
 ### DOS target
 
@@ -131,17 +132,26 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 
 ## Italic Font
 
-The italic character set is generated at build time by `mkitalic.py` using FreeMonoOblique (or DejaVu Sans Mono Oblique as a fallback). The script renders glyphs for ASCII 0x20–0x7E from the TTF at the correct point size for 8×16 cells, and applies an algorithmic slant to the CP437 special characters (box drawing, Greek, math symbols) that have no TTF equivalent.
+The italic character set is generated from `font_vga.h` by `mkitalic.py` using a pure algorithmic slant — no external fonts, no dependencies beyond the Python standard library.
+
+The algorithm shifts each row of every glyph rightward by `(15 - r) >> 2` pixels:
+
+```
+rows  0– 3  →  shift 3 px   (top leans right)
+rows  4– 7  →  shift 2 px
+rows  8–11  →  shift 1 px
+rows 12–15  →  shift 0 px   (bottom is the anchor)
+```
+
+Because it starts from the VGA font, the italic variant has identical stroke weight and pixel density to the normal font. Everything is consistent — same design language, same feel.
 
 To regenerate `deps/thin-vga/font_italic.h`:
 
 ```sh
 python3 mkitalic.py > deps/thin-vga/font_italic.h
-# or with an explicit font:
-python3 mkitalic.py /path/to/MyMonoOblique.ttf > deps/thin-vga/font_italic.h
 ```
 
-Preview what the generated font looks like before committing:
+To preview before regenerating (requires Pillow):
 
 ```sh
 python3 mkitalic.py --preview   # writes italic_preview.png
@@ -246,5 +256,5 @@ Each line record encodes text and format attributes as paired hex strings separa
 - [x] Bold / Italic / Underline rich text
 - [x] MGF5 per-character format storage
 - [x] PCL3 rich text export (escape sequences on format transitions)
-- [ ] Undo / redo
+- [x] Undo (Ctrl-Z, 512 levels)
 - [ ] Search / replace
