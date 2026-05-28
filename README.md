@@ -92,7 +92,9 @@ The default page stops are columns `0` and `79`, with tab stops four columns inw
 | Ctrl-U     | Toggle Underline                  |
 | Ctrl-J     | Justify word under cursor         |
 | Ctrl-T     | Move current line to page header slot |
-| Ctrl-F     | Move current line to page footer slot |
+| Ctrl-E     | Move current line to page footer slot |
+| Ctrl-F     | Open console with `find ` typed   |
+| Ctrl-G     | Repeat previous find              |
 | Ctrl-R     | Arm current header/footer line as repeating template |
 | Esc        | Open / close console              |
 | Tab        | Insert current tab size spaces    |
@@ -130,32 +132,6 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 
 > **Note:** Ctrl-L is used for italic because Ctrl-I is ASCII 9 (Tab) and cannot be distinguished from it at this level.
 
-## Italic Font
-
-The italic character set is generated from `font_vga.h` by `mkitalic.py` using a pure algorithmic slant — no external fonts, no dependencies beyond the Python standard library.
-
-The algorithm shifts each row of every glyph rightward by `(15 - r) >> 2` pixels:
-
-```
-rows  0– 3  →  shift 3 px   (top leans right)
-rows  4– 7  →  shift 2 px
-rows  8–11  →  shift 1 px
-rows 12–15  →  shift 0 px   (bottom is the anchor)
-```
-
-Because it starts from the VGA font, the italic variant has identical stroke weight and pixel density to the normal font. Everything is consistent — same design language, same feel.
-
-To regenerate `deps/thin-vga/font_italic.h`:
-
-```sh
-python3 mkitalic.py > deps/thin-vga/font_italic.h
-```
-
-To preview before regenerating (requires Pillow):
-
-```sh
-python3 mkitalic.py --preview   # writes italic_preview.png
-```
 
 ## Console
 
@@ -170,11 +146,23 @@ Commands:
 | `load PATH`     | Load a text or `.mgf` file                          |
 | `export PATH`   | Write print/plain-text output with page macros expanded |
 | `quit`          | Quit                                                |
-| `pb`            | Insert a page break at the cursor                   |
-| `tab N`         | Set tab size and symmetric tab stops                |
+| `pb`, `break`   | Insert a page break at the cursor                   |
+| `tab N`, `tabs N` | Set tab size and symmetric tab stops              |
 | `stops N`       | Set page stops to `N` and `79 - N`                  |
 | `page N`        | Set page length in lines                            |
+| `header`        | Move current line to page header slot               |
+| `footer`        | Move current line to page footer slot               |
+| `repeat`        | Arm current header/footer line as repeating template |
+| `find TEXT`     | Find `TEXT` from just after the cursor              |
+| `find`, `f`     | Repeat the previous find                            |
+| `replace OLD/NEW` | Replace the next `OLD` match with `NEW`           |
+| `replace all OLD/NEW` | Replace every `OLD` match with `NEW`          |
 | `scale N`       | Set pixel scaling: 1, 2, or 4                       |
+
+Find and replace wrap around the document. Word-like searches, such as
+`find is` or `replace teh/the`, match whole words only, so `is` does not match
+inside `this`. Searches containing spaces or punctuation match the exact typed
+sequence.
 
 ## Justification
 
@@ -193,7 +181,7 @@ Macguffin supports a repeating header (first line of each page) and a repeating 
 **Step 1 — move the line into position**
 
 - `Ctrl-T` physically moves the current line to position 0 of its page. The line turns **red** to confirm it is in the header slot.
-- `Ctrl-F` physically moves the current line to the last position of its page. The line turns **green** to confirm it is in the footer slot.
+- `Ctrl-E` physically moves the current line to the last position of its page. The line turns **green** to confirm it is in the footer slot.
 
 **Step 2 — arm repetition**
 

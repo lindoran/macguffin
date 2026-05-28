@@ -1776,6 +1776,14 @@ static void console_enter(void)
     status_dirty = 1;
 }
 
+static void console_enter_with(const char *input)
+{
+    console_enter();
+    strncpy(console_state.input, input, sizeof(console_state.input) - 1);
+    console_state.input[sizeof(console_state.input) - 1] = '\0';
+    console_state.input_len = (int)strlen(console_state.input);
+}
+
 static int parse_uint(const char *s, int *out)
 {
     int n = 0;
@@ -1903,10 +1911,46 @@ static void command_scale(const char *arg)
 
 static char last_find[FIND_MAX + 1] = "";
 
+static int find_is_word_char(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ||
+           (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '_';
+}
+
+static int find_term_is_word(const char *term)
+{
+    while (*term) {
+        if (!find_is_word_char((unsigned char)*term))
+            return 0;
+        term++;
+    }
+    return 1;
+}
+
+static int find_matches_at(int row, int col, const char *term, int tlen,
+                           int whole_word)
+{
+    if (memcmp(lines[row].buf + col, term, (size_t)tlen) != 0)
+        return 0;
+
+    if (whole_word) {
+        if (col > 0 &&
+            find_is_word_char((unsigned char)lines[row].buf[col - 1]))
+            return 0;
+        if (col + tlen < lines[row].len &&
+            find_is_word_char((unsigned char)lines[row].buf[col + tlen]))
+            return 0;
+    }
+
+    return 1;
+}
+
 /* Search for term from (start_row, start_col).
  * Wraps once if needed. Returns 1 on match, 0 if not found.          */
-static int find_from(const char *term, int start_row, int start_col,
-                     int *out_row, int *out_col)
+static int find_from_mode(const char *term, int start_row, int start_col,
+                          int whole_word, int *out_row, int *out_col)
 {
     int tlen = (int)strlen(term);
     int pass, r, c, llen;
@@ -1921,7 +1965,7 @@ static int find_from(const char *term, int start_row, int start_col,
             llen = lines[r].len;
             c = (r == r_start && pass == 0) ? start_col : 0;
             for (; c <= llen - tlen; c++) {
-                if (memcmp(lines[r].buf + c, term, (size_t)tlen) == 0) {
+                if (find_matches_at(r, c, term, tlen, whole_word)) {
                     *out_row = r;
                     *out_col = c;
                     return 1;
@@ -1930,6 +1974,13 @@ static int find_from(const char *term, int start_row, int start_col,
         }
     }
     return 0;
+}
+
+static int find_from(const char *term, int start_row, int start_col,
+                     int *out_row, int *out_col)
+{
+    return find_from_mode(term, start_row, start_col, find_term_is_word(term),
+                          out_row, out_col);
 }
 
 static void do_find(const char *term)
@@ -1950,6 +2001,8 @@ static void do_find(const char *term)
     if (find_from(last_find, cur_row, cur_col + 1, &found_row, &found_col)) {
         cur_row = found_row;
         cur_col = found_col;
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
         ensure_visible();
         mark_visible_dirty();
         content_dirty = 1;
@@ -2085,6 +2138,16 @@ static void console_execute(void)
         command_stops(arg + 6);
     } else if (strncmp(arg, "page ", 5) == 0) {
         command_page(arg + 5);
+    } else if (strcmp(arg, "header") == 0) {
+        move_to_header();
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
+    } else if (strcmp(arg, "footer") == 0) {
+        move_to_footer();
+        console_state.saved_row = cur_row;
+        console_state.saved_col = cur_col;
+    } else if (strcmp(arg, "repeat") == 0) {
+        repeat_current_row();
     } else if (strcmp(arg, "break") == 0) {
         insert_page_break();
     } else if (strcmp(arg, "save") == 0) {
@@ -2215,8 +2278,12 @@ static void handle_key(int ch)
         move_to_header();
         break;
 
-    case KEY_CTRL('f'):
+    case KEY_CTRL('e'):
         move_to_footer();
+        break;
+
+    case KEY_CTRL('f'):
+        console_enter_with("find ");
         break;
 
     case KEY_CTRL('r'):
