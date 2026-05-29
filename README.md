@@ -71,6 +71,44 @@ The markers are:
 
 The default page stops are columns `0` and `79`, with tab stops four columns inward. `tab 0` makes the tab stops equal to the page stops, which disables auto-indent.
 
+
+## Status Bar
+
+```
+ [new] *             Pg 1  Ln 1  Col 1  10 CPI  B I U INS
+  ^filename          ^page ^line ^col           ^fmt ^mode
+```
+
+- `*` — unsaved changes
+- `B I U` — Bold / Italic / Underline, bright when active, dim when not
+- `INS` / `OVR` — insert or overwrite mode
+
+
+
+## Rich Text
+
+Macguffin supports three character-level formatting attributes: **Bold**, *Italic*, and Underline. These are stored per character and travel with the text through wrapping, joining, splitting, and undo.
+
+| Attribute | Key    | Screen rendering            | PCL3 output          |
+|-----------|--------|-----------------------------|----------------------|
+| Bold      | Ctrl-B | Bright foreground intensity | Stroke weight +3     |
+| Italic    | Ctrl-L | Alternate italic font slot  | Posture: italic      |
+| Underline | Ctrl-U | Pixel underline on row 14   | PCL underline mode   |
+
+All eight combinations (B × I × U) work simultaneously. The current active attributes are shown in the status bar:
+
+```
+... B I U INS
+    ↑ ↑ ↑
+    │ │ └── Underline active (bright) / inactive (dim)
+    │ └──── Italic active / inactive
+    └────── Bold active / inactive
+```
+
+Formatting is stored in the `.mgf` project file alongside the text. Plain-text `.txt` export strips all formatting. PCL3 export emits the appropriate escape sequences so formatting prints correctly on HP DeskJet and compatible printers.
+
+> **Note:** Ctrl-L is used for italic because Ctrl-I is ASCII 9 (Tab) and cannot be distinguished from it at this level.
+
 ## Keybindings
 
 | Key        | Action                            |
@@ -98,31 +136,6 @@ The default page stops are columns `0` and `79`, with tab stops four columns inw
 | Delete     | Delete under cursor               |
 
 Characters 32–255 are passed straight through as CP437 glyphs.
-
-## Rich Text
-
-Macguffin supports three character-level formatting attributes: **Bold**, *Italic*, and Underline. These are stored per character and travel with the text through wrapping, joining, splitting, and undo.
-
-| Attribute | Key    | Screen rendering            | PCL3 output          |
-|-----------|--------|-----------------------------|----------------------|
-| Bold      | Ctrl-B | Bright foreground intensity | Stroke weight +3     |
-| Italic    | Ctrl-L | Alternate italic font slot  | Posture: italic      |
-| Underline | Ctrl-U | Pixel underline on row 14   | PCL underline mode   |
-
-All eight combinations (B × I × U) work simultaneously. The current active attributes are shown in the status bar:
-
-```
-... B I U INS
-    ↑ ↑ ↑
-    │ │ └── Underline active (bright) / inactive (dim)
-    │ └──── Italic active / inactive
-    └────── Bold active / inactive
-```
-
-Formatting is stored in the `.mgf` project file alongside the text. Plain-text `.txt` export strips all formatting. PCL3 export emits the appropriate escape sequences so formatting prints correctly on HP DeskJet and compatible printers.
-
-> **Note:** Ctrl-L is used for italic because Ctrl-I is ASCII 9 (Tab) and cannot be distinguished from it at this level.
-
 
 ## Console
 
@@ -217,23 +230,31 @@ lines <count>
 
 Each line record encodes text and format attributes as paired hex strings separated by `|`. Since text content is hex-encoded, a literal `|` in the document becomes `7C` in the hex stream and is never ambiguous with the separator. Earlier versions (MGF1–MGF4) load cleanly; missing format data defaults to unstyled.
 
-## Status Bar
+## Macguffin is a pencil.
 
-```
- [new] *             Pg 1  Ln 1  Col 1  10 CPI  B I U INS
-  ^filename          ^page ^line ^col           ^fmt ^mode
-```
+Macguffin is a tool, like a pencil, as such it belongs in a toolbox, not in a box for sale.  It is for you to make other things.  You can support macguffin if its usefull, and you are so inclided to you by emailing me at z80dad (at) gmail (dot) com.
 
-- `*` — unsaved changes
-- `B I U` — Bold / Italic / Underline, bright when active, dim when not
-- `INS` / `OVR` — insert or overwrite mode
+## License
 
-## Roadmap
+MIT License
 
-- [x] Save-as / unnamed-file save flow
-- [x] Explicit page breaks
-- [x] Bold / Italic / Underline rich text
-- [x] MGF5 per-character format storage
-- [x] PCL3 rich text export (escape sequences on format transitions)
-- [x] Undo (Ctrl-Z, 512 levels)
-- [x] Search / replace
+Copyright David Collins(c) 2026
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
