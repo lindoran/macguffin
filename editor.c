@@ -2,7 +2,10 @@
  * editor.c  --  minimal CP437 text editor via thin-vga
  *
  * Deterministic, fixed-geometry 80x25 text mode.
+ *
+ * _POSIX_C_SOURCE 200809L: enables popen, pclose, mkstemp, snprintf.
  */
+#define _POSIX_C_SOURCE 200809L
 
 #include "vgaterm.h"
 #include "vio.h"
@@ -13,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <limits.h>
 
 /* ------------------------------------------------------------------ */
@@ -61,6 +65,7 @@ typedef struct {
     int  active;
     int  has_error;
     int  pending_save_as;
+    int  pending_spell_suggest;    /* in suggestion scroll mode      */
     char error_msg[80];
     char pending_path[512];
     char input[80];
@@ -68,6 +73,25 @@ typedef struct {
     int  saved_row;
     int  saved_col;
 } Console;
+
+/* ------------------------------------------------------------------ */
+/*  Spell check state                                                  */
+/* ------------------------------------------------------------------ */
+#define SPELL_MAX_WORDS   512
+#define SPELL_WORD_LEN     64
+#define SPELL_MAX_SUGS     16
+
+typedef struct {
+    char words[SPELL_MAX_WORDS][SPELL_WORD_LEN]; /* misspelled words   */
+    int  count;                                  /* words found        */
+    int  idx;                                    /* current position   */
+    int  active;                                 /* results loaded     */
+    char sugs[SPELL_MAX_SUGS][SPELL_WORD_LEN];  /* suggestions        */
+    int  sug_count;                              /* suggestions found  */
+    int  sug_idx;                                /* selected sug       */
+} SpellState;
+
+static SpellState spell_state;
 
 static Line lines[MAX_LINES];
 static int  nlines = 1;
@@ -523,6 +547,34 @@ static void draw_status(void)
 
         vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
         vio_clrline(VGA_ROWS - 1, VGA_ATTR(VGA_CYAN, VGA_BLACK));
+
+        /* Suggestion scroll mode: full-width, no input prompt         */
+        if (console_state.pending_spell_suggest) {
+            char left[50];
+            const char *word = spell_state.words[spell_state.idx];
+
+            if (spell_state.sug_count > 0) {
+                snprintf(left, sizeof(left), "spell %d/%d: \"%s\" \xf0 %s",
+                         spell_state.idx + 1, spell_state.count, word,
+                         spell_state.sugs[spell_state.sug_idx]);
+            } else {
+                snprintf(left, sizeof(left), "spell %d/%d: \"%s\" (no suggestions)",
+                         spell_state.idx + 1, spell_state.count, word);
+            }
+            vio_gotoxy(0, VGA_ROWS - 1);
+            for (i = 0; left[i] && i < input_start - 1; i++)
+                vio_putch((unsigned char)left[i]);
+
+            /* Right side: hint text */
+            vio_gotoxy(input_start, VGA_ROWS - 1);
+            if (spell_state.sug_count > 0)
+                vio_puts("\x18\x19 sel  \x0d acc  ESC skip  Q quit");
+            else
+                vio_puts("ESC skip  Q quit");
+
+            status_dirty = 0;
+            return;
+        }
 
         if (console_state.has_error) {
             vio_gotoxy(0, VGA_ROWS - 1);
@@ -1645,6 +1697,8 @@ static void console_exit(void)
     console_state.input[0] = '\0';
     cur_row = console_state.saved_row;
     cur_col = console_state.saved_col;
+    spell_state.active = 0;
+    console_state.pending_spell_suggest = 0;
     status_dirty = 1;
 }
 
@@ -1918,6 +1972,24 @@ static void replace_at(int row, int col, int old_len, const char *repl)
 }
 
 /* Parse "old/new" into old and new parts. Returns 1 on success.      */
+static void trim_str(char *s)
+{
+    int len, start;
+
+    /* ltrim */
+    start = 0;
+    while (s[start] == ' ' || s[start] == '\t') start++;
+    if (start > 0) {
+        len = (int)strlen(s) - start;
+        memmove(s, s + start, (size_t)(len + 1));
+    }
+
+    /* rtrim */
+    len = (int)strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t'))
+        s[--len] = '\0';
+}
+
 static int parse_replace_args(const char *arg,
                                char *old_buf, int old_max,
                                char *new_buf, int new_max)
@@ -1935,6 +2007,12 @@ static int parse_replace_args(const char *arg,
     old_buf[olen] = '\0';
     memcpy(new_buf, sep + 1, (size_t)nlen);
     new_buf[nlen] = '\0';
+
+    trim_str(old_buf);
+    trim_str(new_buf);
+
+    if (old_buf[0] == '\0') return 0;
+
     return 1;
 }
 
@@ -2010,6 +2088,320 @@ static void do_replace_all(const char *arg)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Spell check                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Run aspell list on the document text and populate spell_state.
+ * Returns number of misspelled words found, or -1 on error.         */
+static int spell_run(void)
+{
+    char tmp_path[] = "/tmp/mg_spell_XXXXXX";
+    char cmd[sizeof(tmp_path) + 32];
+    FILE *f;
+    int fd, i, pages;
+    char line[SPELL_WORD_LEN * 2];
+
+    /* Write plain text to a safe temp file */
+    fd = mkstemp(tmp_path);
+    if (fd < 0) return -1;
+
+    f = fdopen(fd, "w");
+    if (!f) { close(fd); remove(tmp_path); return -1; }
+
+    pages = total_pages();
+    for (i = 0; i < nlines; i++) {
+        if (!(line_flags[i] & LINE_FLAG_PAGE_BREAK)) {
+            save_line_expanded(f, &lines[i], i, pages);
+            fputc('\n', f);
+        }
+    }
+    fclose(f);
+
+    /* Build: aspell list < tmpfile */
+    snprintf(cmd, sizeof(cmd), "aspell list < \"%s\" 2>/dev/null", tmp_path);
+
+    f = popen(cmd, "r");
+    if (!f) {
+        remove(tmp_path);
+        return -1;
+    }
+
+    spell_state.count = 0;
+    while (fgets(line, sizeof(line), f) && spell_state.count < SPELL_MAX_WORDS) {
+        int len = (int)strlen(line);
+        /* strip trailing newline */
+        if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
+        if (len == 0) continue;
+        /* skip duplicates */
+        for (i = 0; i < spell_state.count; i++) {
+            if (strcmp(spell_state.words[i], line) == 0) break;
+        }
+        if (i == spell_state.count) {
+            /* truncate to SPELL_WORD_LEN-1; anything longer is exotic */
+            int copy_len = len < SPELL_WORD_LEN - 1 ? len : SPELL_WORD_LEN - 1;
+            memcpy(spell_state.words[spell_state.count], line, (size_t)copy_len);
+            spell_state.words[spell_state.count][copy_len] = '\0';
+            spell_state.count++;
+        }
+    }
+
+    pclose(f);
+    remove(tmp_path);
+
+    return spell_state.count;
+}
+
+/* Navigate to the current spell_state.idx word in the buffer.
+ * Returns 1 if found and moved, 0 if the word isn't in the document.*/
+static int spell_goto_current(void)
+{
+    int found_row, found_col;
+    const char *word;
+
+    if (spell_state.idx < 0 || spell_state.idx >= spell_state.count)
+        return 0;
+
+    word = spell_state.words[spell_state.idx];
+
+    /* whole-word search from top each time — simple and correct      */
+    if (!find_from_mode(word, 0, 0, 1, &found_row, &found_col))
+        return 0;
+
+    cur_row = found_row;
+    cur_col = found_col;
+    console_state.saved_row = cur_row;
+    console_state.saved_col = cur_col;
+    ensure_visible();
+    mark_visible_dirty();
+    content_dirty = 1;
+    status_dirty  = 1;
+    return 1;
+}
+
+/* Show current spell result in the status bar error area.            */
+/* Fetch suggestions for word via "echo word | aspell -a".
+ * Populates spell_state.sugs / sug_count / sug_idx.                 */
+static void spell_fetch_suggestions(const char *word)
+{
+    char tmp_path[] = "/tmp/mg_sug_XXXXXX";
+    char cmd[sizeof(tmp_path) + 32];
+    char line[256];
+    FILE *f;
+    int  fd;
+
+    spell_state.sug_count = 0;
+    spell_state.sug_idx   = 0;
+
+    /* Write word to tmpfile â avoids all shell quoting issues        */
+    fd = mkstemp(tmp_path);
+    if (fd < 0) return;
+    f = fdopen(fd, "w");
+    if (!f) { close(fd); remove(tmp_path); return; }
+    fputs(word, f);
+    fputc('\n', f);
+    fclose(f);
+
+    snprintf(cmd, sizeof(cmd), "aspell -a < \"%s\" 2>/dev/null", tmp_path);
+    f = popen(cmd, "r");
+    if (!f) { remove(tmp_path); return; }
+
+    /* First line is the aspell version banner — discard it           */
+    if (!fgets(line, sizeof(line), f)) { pclose(f); remove(tmp_path); return; }
+
+    /* Second line is the result for our word                         */
+    if (!fgets(line, sizeof(line), f)) { pclose(f); remove(tmp_path); return; }
+
+    pclose(f);
+    remove(tmp_path);
+
+    /* '&' = misspelled with suggestions: & word count offset: s1, s2 */
+    if (line[0] == '&') {
+        char *colon = strchr(line, ':');
+        char *p;
+        if (!colon) return;
+        p = colon + 2; /* skip ": " */
+        while (*p && spell_state.sug_count < SPELL_MAX_SUGS) {
+            char *comma = strchr(p, ',');
+            int   len;
+            if (comma) {
+                len = (int)(comma - p);
+            } else {
+                len = (int)strlen(p);
+                /* strip trailing newline */
+                while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r'))
+                    len--;
+            }
+            if (len > 0) {
+                int copy = len < SPELL_WORD_LEN - 1 ? len : SPELL_WORD_LEN - 1;
+                memcpy(spell_state.sugs[spell_state.sug_count], p, (size_t)copy);
+                spell_state.sugs[spell_state.sug_count][copy] = '\0';
+                spell_state.sug_count++;
+            }
+            if (!comma) break;
+            p = comma + 2; /* skip ", " */
+        }
+    }
+    /* '#' = no suggestions — sug_count stays 0, handled in draw     */
+}
+
+/* Enter suggestion scroll mode for the current word.
+ * Assumes spell_goto_current() has already placed the cursor.        */
+static void spell_enter_suggest(void)
+{
+    spell_fetch_suggestions(spell_state.words[spell_state.idx]);
+    console_state.pending_spell_suggest = 1;
+    console_state.has_error = 0;
+    status_dirty = 1;
+}
+
+/* Advance to the next word in the list.
+ * Returns 1 if there is a next word, 0 if the list is exhausted.    */
+static int spell_advance(void)
+{
+    spell_state.idx++;
+    if (spell_state.idx >= spell_state.count) {
+        spell_state.active = 0;
+        console_state.pending_spell_suggest = 0;
+        set_console_error("spell: done");
+        return 0;
+    }
+    if (spell_goto_current()) {
+        spell_enter_suggest();
+    } else {
+        /* Word was edited away; show status, let user keep navigating */
+        spell_enter_suggest();
+    }
+    return 1;
+}
+
+/* Handle keys while in suggestion scroll mode.                       */
+static void handle_spell_suggest_key(int ch)
+{
+    if (ch == 'q' || ch == 'Q') {
+        /* Hard quit — leave console entirely                         */
+        spell_state.active = 0;
+        console_state.pending_spell_suggest = 0;
+        console_exit();
+        return;
+    }
+
+    if (ch == KEY_ESC) {
+        /* Skip this word, advance to next                            */
+        console_state.pending_spell_suggest = 0;
+        spell_advance();
+        return;
+    }
+
+    if (ch == KEY_ENTER) {
+        /* Accept selected suggestion — replace word in buffer        */
+        if (spell_state.sug_count > 0) {
+            const char *word = spell_state.words[spell_state.idx];
+            const char *sug  = spell_state.sugs[spell_state.sug_idx];
+            replace_at(cur_row, cur_col, (int)strlen(word), sug);
+            modified      = 1;
+            content_dirty = 1;
+            status_dirty  = 1;
+            ensure_visible();
+        }
+        console_state.pending_spell_suggest = 0;
+        spell_advance();
+        return;
+    }
+
+    if (ch == KEY_UP) {
+        if (spell_state.sug_count > 0) {
+            spell_state.sug_idx--;
+            if (spell_state.sug_idx < 0)
+                spell_state.sug_idx = spell_state.sug_count - 1;
+            status_dirty = 1;
+        }
+        return;
+    }
+
+    if (ch == KEY_DOWN) {
+        if (spell_state.sug_count > 0) {
+            spell_state.sug_idx++;
+            if (spell_state.sug_idx >= spell_state.sug_count)
+                spell_state.sug_idx = 0;
+            status_dirty = 1;
+        }
+        return;
+    }
+}
+
+static void spell_show_status(void)
+{
+    char msg[80];
+
+    if (!spell_state.active) return;
+
+    if (spell_state.count == 0) {
+        set_console_error("spell: no misspellings found");
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "spell %d/%d: \"%s\"  [n]ext [p]rev [q]uit",
+             spell_state.idx + 1, spell_state.count,
+             spell_state.words[spell_state.idx]);
+    set_console_error(msg);
+}
+
+/* Console command: spell — run aspell and go to first hit.           */
+static void command_spell(void)
+{
+    int n;
+
+    n = spell_run();
+    if (n < 0) {
+        set_console_error("spell: aspell not found or failed");
+        spell_state.active = 0;
+        return;
+    }
+
+    spell_state.active = 1;
+    spell_state.idx    = 0;
+
+    if (n == 0) {
+        set_console_error("spell: no misspellings found");
+        return;
+    }
+
+    if (spell_goto_current())
+        spell_enter_suggest();
+    else
+        set_console_error("spell: word not locatable in buffer");
+}
+
+/* Console commands: spell n / spell p / spell q (fallback nav)       */
+static void command_spell_nav(const char *arg)
+{
+    if (!spell_state.active || spell_state.count == 0) {
+        set_console_error("spell: run spell first");
+        return;
+    }
+
+    if (strcmp(arg, "n") == 0 || strcmp(arg, "next") == 0) {
+        spell_state.idx++;
+        if (spell_state.idx >= spell_state.count) spell_state.idx = 0;
+    } else if (strcmp(arg, "p") == 0 || strcmp(arg, "prev") == 0) {
+        spell_state.idx--;
+        if (spell_state.idx < 0) spell_state.idx = spell_state.count - 1;
+    } else if (strcmp(arg, "q") == 0 || strcmp(arg, "quit") == 0) {
+        spell_state.active = 0;
+        set_console_error("spell: done");
+        return;
+    } else {
+        set_console_error("spell: n, p, or q");
+        return;
+    }
+
+    if (spell_goto_current())
+        spell_enter_suggest();
+    else
+        spell_show_status();
+}
+
 static void console_execute(void)
 {
     char cmd[80];
@@ -2074,18 +2466,27 @@ static void console_execute(void)
         running = 0;
     } else if (strncmp(arg, "scale ", 6) == 0) {
         command_scale(arg + 6);
+    } else if (strcmp(arg, "spell") == 0) {
+        command_spell();
+    } else if (strncmp(arg, "spell ", 6) == 0) {
+        command_spell_nav(arg + 6);
     } else if (arg[0] == '\0') {
         console_exit();
     } else {
         set_console_error("unknown command");
     }
 
-    if (!console_state.has_error && running)
+    if (!console_state.has_error && running && !spell_state.active)
         console_exit();
 }
 
 static void handle_console_key(int ch)
 {
+    if (console_state.pending_spell_suggest) {
+        handle_spell_suggest_key(ch);
+        return;
+    }
+
     if (console_state.pending_save_as) {
         if (ch == KEY_ESC) {
             console_state.pending_save_as = 0;
