@@ -111,31 +111,125 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 
 ## Keybindings
 
-| Key        | Action                            |
-|------------|-----------------------------------|
-| Ctrl-S     | Save (no-op if unnamed)           |
-| Ctrl-N     | New file                          |
-| Ctrl-Q     | Quit                              |
-| Ctrl-B     | Toggle **Bold**                   |
-| Ctrl-L     | Toggle *Italic*                   |
-| Ctrl-U     | Toggle Underline                  |
-| Ctrl-J     | Justify word under cursor         |
-| Ctrl-T     | Move current line to page header slot |
-| Ctrl-E     | Move current line to page footer slot |
-| Ctrl-F     | Open console with `find ` typed   |
-| Ctrl-G     | Repeat previous find              |
-| Ctrl-R     | Arm current header/footer line as repeating template |
-| Esc        | Open / close console              |
-| Tab        | Insert current tab size spaces    |
-| Insert     | Toggle INS / OVR                  |
-| Arrows     | Move cursor                       |
-| Home / End | Left tab / end of line            |
-| PgUp/PgDn  | Scroll a screenful                |
-| Enter      | Split line                        |
-| Backspace  | Delete before cursor              |
-| Delete     | Delete under cursor               |
+| Key              | Action                                          |
+|------------------|-------------------------------------------------|
+| Ctrl-S           | Save (no-op if unnamed)                         |
+| Ctrl-N           | New file                                        |
+| Ctrl-Q           | Quit                                            |
+| Ctrl-B           | Toggle **Bold**                                 |
+| Ctrl-L           | Toggle *Italic*                                 |
+| Ctrl-U           | Toggle Underline                                |
+| Ctrl-J           | Justify word under cursor                       |
+| Ctrl-T           | Move current line to page header slot           |
+| Ctrl-E           | Move current line to page footer slot           |
+| Ctrl-F           | Open console with `find ` typed                 |
+| Ctrl-G           | Repeat previous find                            |
+| Ctrl-R           | Arm current header/footer as repeating template |
+| Ctrl-K           | Drop mark anchor / close mark region            |
+| Ctrl-Y           | Kill current line → undelete slot                |
+| Ctrl-Backspace   | Kill word backward → undelete slot              |
+| Ctrl-Delete      | Kill word forward → undelete slot               |
+| Esc              | Cancel mark / open console                      |
+| Tab              | Insert current tab size spaces                  |
+| Insert           | Toggle INS / OVR                                |
+| Arrows           | Move cursor (clears defined mark)               |
+| Shift+Arrows     | Start / extend mark selection                   |
+| Home / End       | Left tab / end of line                          |
+| PgUp / PgDn      | Scroll a screenful                              |
+| Enter            | Split line                                      |
+| Backspace        | INS: collapse left / OVR: move left, blank cell |
+| Delete           | INS: collapse right / OVR: blank cell in place  |
+| F1               | Kill marked region → undelete slot               |
+| F4               | Undelete (restore last killed)                  |
 
 Characters 32–255 are passed straight through as CP437 glyphs.
+
+## Mark and Kill
+
+Macguffin uses a **mark and kill** model rather than a conventional clipboard. This fits the fixed-geometry editing philosophy: operations are intentional and permanent, with a single-slot undelete buffer for immediate recovery.
+
+### Two ways to define a region
+
+**Shift+arrow** — for small selections. Hold Shift and press an arrow key to start a mark at the current cursor position and extend it one step. Continue holding Shift and arrowing to extend further. Plain arrow cancels the mark. If a mark was already defined, Shift+arrow starts a fresh mark from the current cursor position.
+
+**Ctrl+K...Ctrl+K** — for larger blocks. First Ctrl+K drops an anchor at the cursor; the status bar shows `[^K] second mark  [ESC] cancel`. Navigate freely with plain arrows — the mark stays. Second Ctrl+K closes the region; the status bar changes to `[F1] kill  [ESC] cancel`. ESC at any point cancels without killing.
+
+Both paths arrive at the same defined region, shown inverted on screen.
+
+### INS and OVR mode affect all delete operations
+
+The Insert/Overwrite toggle (Insert key) controls how every delete action — backspace, delete, word kill, and mark kill — behaves. This keeps the editing model consistent throughout.
+
+**In INS mode** delete operations collapse: characters are removed and content shifts to fill the gap. Lines shorten or are joined. This is the conventional text-editor behaviour.
+
+**In OVR mode** delete operations blank: characters are replaced with spaces and nothing shifts. The physical space on the page is preserved. Lines are never shortened or joined by a delete in OVR mode. This matches typewriter correction behaviour — like correction fluid that erases without disturbing the surrounding layout.
+
+| Operation      | INS                                 | OVR                                |
+|----------------|-------------------------------------|------------------------------------|
+| Backspace      | Collapse left; join lines at col 0  | Move left, blank cell; stop at col 0 |
+| Delete         | Collapse right; join lines at end   | Blank cell in place; stop at end   |
+| Ctrl+Backspace | Collapse word span                  | Blank word span with spaces        |
+| Ctrl+Delete    | Collapse word span                  | Blank word span with spaces        |
+| Ctrl+Y         | Truncate line to empty              | Blank all content, line stays      |
+| F1 mark kill   | Collapse region, remove lines       | Blank region, no line removal      |
+
+Every OVR blank is individually recorded in the undo ring (Ctrl+Z restores the original character in place). INS collapses use the existing character and join undo records.
+
+### Kill operations
+
+All kill operations (F1, Ctrl+Y, Ctrl+Backspace, Ctrl+Delete) store the killed content in the single undelete slot, replacing whatever was there previously. There is no kill ring.
+
+| Key            | What is killed                          |
+|----------------|-----------------------------------------|
+| F1             | Defined marked region                   |
+| Ctrl+Y         | Current line content (line stays empty) |
+| Ctrl+Backspace | Word before cursor                      |
+| Ctrl+Delete    | Word after cursor                       |
+
+### Undelete
+
+**F4** restores the last killed content at the cursor position, preserving the original character formatting. Undelete is the inverse of the kill that produced it:
+
+- If the kill was done in **INS mode**: F4 re-inserts the content, shifting existing content open. Obeys tab stops and wraps identically to typing. Each restored character is recorded in the undo ring.
+- If the kill was done in **OVR mode**: F4 overwrites from the cursor position with the original characters, restoring them in place without shifting anything.
+
+The mode at kill time is remembered automatically — you do not need to be in the same mode when you undelete.
+
+## Spell Check
+
+Macguffin integrates with `aspell` as an external spell checker, run on demand from the console — not inline while typing. This fits naturally into a proofing-before-print workflow.
+
+### Running a spell check
+
+```
+spell
+```
+
+Macguffin exports the document text to a temporary file, runs `aspell list`, deduplicates the results, and jumps to the first misspelled word. The status bar enters suggestion mode:
+
+```
+spell 3/12: "recieve" → receive   ↑↓ scroll  ⏎ accept  ESC skip  Q quit
+```
+
+| Key    | Action                                      |
+|--------|---------------------------------------------|
+| ↑ / ↓  | Scroll through aspell's suggestions         |
+| Enter  | Accept selected suggestion and advance      |
+| ESC    | Skip this word, advance to next             |
+| Q      | Quit spell check entirely                   |
+
+If aspell has no suggestions for a word, `(no suggestions)` is shown and only ESC and Q apply.
+
+From the console, `spell n`, `spell p`, and `spell q` also navigate and quit without re-running the full check.
+
+### Requirements
+
+`aspell` must be installed:
+
+```sh
+sudo apt install aspell aspell-en     # Debian/Ubuntu
+sudo pacman -S aspell aspell-en       # Arch
+```
 
 ## Console
 
@@ -162,11 +256,18 @@ Commands:
 | `replace OLD/NEW` | Replace the next `OLD` match with `NEW`           |
 | `replace all OLD/NEW` | Replace every `OLD` match with `NEW`          |
 | `scale N`       | Set pixel scaling: 1, 2, or 4                       |
+| `spell`         | Run spell check, jump to first misspelling          |
+| `spell n`       | Advance to next misspelled word                     |
+| `spell p`       | Go back to previous misspelled word                 |
+| `spell q`       | Quit spell check mode                               |
 
 Find and replace wrap around the document. Word-like searches, such as
 `find is` or `replace teh/the`, match whole words only, so `is` does not match
 inside `this`. Searches containing spaces or punctuation match the exact typed
 sequence.
+
+Spaces around the `/` separator in replace commands are stripped automatically,
+so `replace is / was` and `replace is/was` are equivalent.
 
 ## Justification
 

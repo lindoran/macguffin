@@ -93,6 +93,37 @@ typedef struct {
 
 static SpellState spell_state;
 
+/* Forward declaration — defined later in editing section.           */
+static void wrap_current_line(void);
+
+/* ------------------------------------------------------------------ */
+/*  Mark / kill state                                                  */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    MARK_NONE = 0,
+    MARK_CTRL_K,     /* anchor placed, navigating freely to second mark */
+    MARK_DEFINED     /* region closed, showing kill/cancel prompt        */
+} MarkMode;
+
+typedef struct {
+    MarkMode mode;
+    int      anchor_row;
+    int      anchor_col;
+} MarkState;
+
+static MarkState mark_state;
+
+/* ------------------------------------------------------------------ */
+/*  Undelete slot                                                      */
+/* ------------------------------------------------------------------ */
+#define UNDEL_MAX (VGA_COLS * 256)   /* up to 256 lines of content    */
+
+static char          undel_text[UNDEL_MAX];
+static unsigned char undel_fmt_buf[UNDEL_MAX];
+static int           undel_len        = 0;
+static int           undel_active     = 0;
+static int           undel_was_insert = 1;  /* 0 = OVR blank, 1 = INS collapse */
+
 static Line lines[MAX_LINES];
 static int  nlines = 1;
 static unsigned char line_flags[MAX_LINES];
@@ -399,10 +430,11 @@ static void ensure_visible(void)
 #define UNDO_MAX 512
 
 typedef enum {
-    UNDO_INS_CHAR,  /* undo: delete char at (row,col)              */
-    UNDO_DEL_CHAR,  /* undo: insert char ch/fmt at (row,col)       */
-    UNDO_SPLIT,     /* undo: join lines[row] and lines[row+1]      */
-    UNDO_JOIN       /* undo: split lines[row] at col               */
+    UNDO_INS_CHAR,   /* undo: delete char at (row,col)              */
+    UNDO_DEL_CHAR,   /* undo: insert char ch/fmt at (row,col)       */
+    UNDO_SPLIT,      /* undo: join lines[row] and lines[row+1]      */
+    UNDO_JOIN,       /* undo: split lines[row] at col               */
+    UNDO_OVR_BLANK   /* undo: restore ch/fmt at (row,col) in place  */
 } UndoType;
 
 typedef struct {
@@ -467,6 +499,17 @@ static void undo_push_join(int row, int split_col)
     memcpy(r->line_fmt, l1->fmt, (size_t)tail);
 }
 
+/* Record an overwrite-blank so Ctrl+Z can restore the original char. */
+static void undo_push_ovr_blank(int row, int col)
+{
+    UndoRecord *r = undo_push();
+    r->type     = UNDO_OVR_BLANK;
+    r->row      = row;
+    r->col      = col;
+    r->ch       = (col < lines[row].len) ? lines[row].buf[col] : ' ';
+    r->fmt_byte = (col < lines[row].len) ? lines[row].fmt[col] : 0;
+}
+
 static void do_undo(void)
 {
     UndoRecord *r;
@@ -524,12 +567,357 @@ static void do_undo(void)
         line_dirty[cur_row] = 1;
         mark_visible_dirty();
         break;
+
+    case UNDO_OVR_BLANK:
+        /* Restore original char in place — no shifting.             */
+        cur_row = r->row;
+        cur_col = r->col;
+        if (cur_col < lines[cur_row].len) {
+            lines[cur_row].buf[cur_col] = r->ch;
+            lines[cur_row].fmt[cur_col] = r->fmt_byte;
+            line_dirty[cur_row] = 1;
+        }
+        break;
     }
 
     modified      = 1;
     status_dirty  = 1;
     content_dirty = 1;
     ensure_visible();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mark helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Return region bounds in document order (start <= end row-major).   */
+static void mark_region_bounds(int *sr, int *sc, int *er, int *ec)
+{
+    int ar = mark_state.anchor_row, ac = mark_state.anchor_col;
+    int cr = cur_row, cc = cur_col;
+
+    if (ar < cr || (ar == cr && ac <= cc)) {
+        *sr = ar; *sc = ac; *er = cr; *ec = cc;
+    } else {
+        *sr = cr; *sc = cc; *er = ar; *ec = ac;
+    }
+}
+
+/* Is document cell (lr, c) inside the current defined region?        */
+static int mark_cell_selected(int lr, int c)
+{
+    int sr, sc, er, ec;
+    if (mark_state.mode != MARK_DEFINED) return 0;
+    mark_region_bounds(&sr, &sc, &er, &ec);
+    if (lr < sr || lr > er) return 0;
+    if (lr == sr && c < sc) return 0;
+    if (lr == er && c >= ec) return 0;
+    return 1;
+}
+
+/* Clear mark and force full visible redraw.                          */
+static void mark_clear(void)
+{
+    mark_state.mode = MARK_NONE;
+    mark_visible_dirty();
+    status_dirty  = 1;
+    content_dirty = 1;
+}
+
+/* Delete line r entirely, shifting everything above it down.         */
+static void delete_line(int r)
+{
+    int i;
+    if (r < 0 || r >= nlines) return;
+    line_free(&lines[r]);
+    for (i = r; i < nlines - 1; i++) {
+        lines[i]      = lines[i + 1];
+        line_flags[i] = line_flags[i + 1];
+        line_dirty[i] = line_dirty[i + 1];
+    }
+    nlines--;
+}
+
+/* Blank chars [start, start+len) on line row with spaces.
+ * Used by all OVR-mode kill operations.                              */
+static void ovr_blank_range(int row, int start, int len)
+{
+    int i;
+    Line *l = &lines[row];
+    for (i = start; i < start + len && i < l->len; i++) {
+        l->buf[i] = ' ';
+        l->fmt[i] = 0;
+    }
+    line_dirty[row] = 1;
+}
+
+/* Kill the defined marked region into the undelete slot.             */
+static void command_kill_mark(void)
+{
+    int sr, sc, er, ec, r, i;
+
+    if (mark_state.mode != MARK_DEFINED) return;
+    mark_region_bounds(&sr, &sc, &er, &ec);
+
+    /* --- Store to undelete slot ----------------------------------- */
+    undel_len = 0;
+
+    if (sr == er) {
+        int len = ec - sc;
+        if (len > 0 && len < UNDEL_MAX) {
+            memcpy(undel_text    + undel_len, lines[sr].buf + sc, (size_t)len);
+            memcpy(undel_fmt_buf + undel_len, lines[sr].fmt + sc, (size_t)len);
+            undel_len += len;
+        }
+    } else {
+        /* First line: sc to end */
+        int flen = lines[sr].len - sc;
+        if (flen > 0 && undel_len + flen < UNDEL_MAX) {
+            memcpy(undel_text    + undel_len, lines[sr].buf + sc, (size_t)flen);
+            memcpy(undel_fmt_buf + undel_len, lines[sr].fmt + sc, (size_t)flen);
+            undel_len += flen;
+        }
+        if (undel_len < UNDEL_MAX) {
+            undel_text[undel_len]    = '\n';
+            undel_fmt_buf[undel_len] = 0;
+            undel_len++;
+        }
+        /* Middle lines */
+        for (r = sr + 1; r < er; r++) {
+            int mlen = lines[r].len;
+            if (undel_len + mlen < UNDEL_MAX) {
+                memcpy(undel_text    + undel_len, lines[r].buf, (size_t)mlen);
+                memcpy(undel_fmt_buf + undel_len, lines[r].fmt, (size_t)mlen);
+                undel_len += mlen;
+            }
+            if (undel_len < UNDEL_MAX) {
+                undel_text[undel_len]    = '\n';
+                undel_fmt_buf[undel_len] = 0;
+                undel_len++;
+            }
+        }
+        /* Last line: 0 to ec */
+        if (ec > 0 && undel_len + ec < UNDEL_MAX) {
+            memcpy(undel_text    + undel_len, lines[er].buf, (size_t)ec);
+            memcpy(undel_fmt_buf + undel_len, lines[er].fmt, (size_t)ec);
+            undel_len += ec;
+        }
+    }
+    undel_active     = (undel_len > 0);
+    undel_was_insert = ins_mode;
+
+    /* --- Delete content from buffer ------------------------------ */
+    if (!ins_mode) {
+        /* OVR: blank region with spaces, geometry unchanged          */
+        if (sr == er) {
+            ovr_blank_range(sr, sc, ec - sc);
+        } else {
+            ovr_blank_range(sr, sc, lines[sr].len - sc);
+            for (r = sr + 1; r < er; r++)
+                ovr_blank_range(r, 0, lines[r].len);
+            ovr_blank_range(er, 0, ec);
+        }
+        cur_row = sr;
+        cur_col = sc;
+    } else {
+        /* INS: collapse — existing logic                             */
+        if (sr == er) {
+            int count = ec - sc;
+            for (i = 0; i < count; i++)
+                line_del(&lines[sr], sc);
+            line_dirty[sr] = 1;
+        } else {
+            line_truncate(&lines[sr], sc);
+            line_dirty[sr] = 1;
+            for (r = er - 1; r > sr; r--)
+                delete_line(r);
+            for (i = 0; i < ec; i++)
+                line_del(&lines[sr + 1], 0);
+            line_dirty[sr + 1] = 1;
+            join_lines(sr);
+            line_dirty[sr] = 1;
+        }
+        cur_row = sr;
+        cur_col = sc;
+    }
+    mark_state.mode = MARK_NONE;
+    modified      = 1;
+    content_dirty = 1;
+    status_dirty  = 1;
+    ensure_visible();
+    mark_visible_dirty();
+}
+
+/* Restore undelete slot at cursor — preserves fmt.                  */
+static void command_undelete(void)
+{
+    int i;
+    if (!undel_active || undel_len == 0) return;
+
+    if (!undel_was_insert) {
+        /* OVR kill: overwrite spaces back with original content     */
+        for (i = 0; i < undel_len; i++) {
+            char          ch  = undel_text[i];
+            unsigned char fmt = undel_fmt_buf[i];
+
+            if (ch == '\n') {
+                /* Multi-line OVR kill: advance to next line, col 0  */
+                cur_row++;
+                cur_col = 0;
+                if (cur_row >= nlines) break;
+            } else {
+                Line *l = &lines[cur_row];
+                if (cur_col < l->len) {
+                    undo_push_ovr_blank(cur_row, cur_col);
+                    l->buf[cur_col] = ch;
+                    l->fmt[cur_col] = fmt;
+                    line_dirty[cur_row] = 1;
+                }
+                cur_col++;
+                modified      = 1;
+                content_dirty = 1;
+            }
+        }
+    } else {
+        /* INS kill: re-insert, shifting content open                */
+        for (i = 0; i < undel_len; i++) {
+            char          ch  = undel_text[i];
+            unsigned char fmt = undel_fmt_buf[i];
+
+            if (ch == '\n') {
+                if (nlines < MAX_LINES) {
+                    undo_push_split();
+                    split_line(cur_row, cur_col);
+                    line_dirty[cur_row]     = 1;
+                    line_dirty[cur_row + 1] = 1;
+                    cur_row++;
+                    cur_col       = 0;
+                    modified      = 1;
+                    content_dirty = 1;
+                }
+            } else {
+                Line *l = &lines[cur_row];
+                if (cur_col < tabs.left_page)      cur_col = tabs.left_page;
+                if (cur_col > tabs.right_page + 1) cur_col = tabs.right_page + 1;
+                line_pad_to(l, cur_col);
+                undo_push_ins_char();
+                line_ins(l, cur_col, ch, fmt);
+                line_dirty[cur_row] = 1;
+                cur_col++;
+                modified      = 1;
+                content_dirty = 1;
+                wrap_current_line();
+            }
+        }
+    }
+
+    ensure_visible();
+    status_dirty = 1;
+}
+
+/* Kill current line content → undelete slot. Line stays (empty).    */
+static void command_kill_line(void)
+{
+    Line *l   = &lines[cur_row];
+    int   len = l->len;
+
+    undel_len        = 0;
+    undel_active     = 0;
+    undel_was_insert = ins_mode;
+
+    if (len > 0 && len < UNDEL_MAX) {
+        memcpy(undel_text,    l->buf, (size_t)len);
+        memcpy(undel_fmt_buf, l->fmt, (size_t)len);
+        undel_len    = len;
+        undel_active = 1;
+    }
+
+    if (ins_mode) {
+        line_truncate(l, 0);
+    } else {
+        /* OVR: blank the content, keep the line length              */
+        ovr_blank_range(cur_row, 0, len);
+    }
+
+    cur_col             = 0;
+    line_dirty[cur_row] = 1;
+    modified            = 1;
+    content_dirty       = 1;
+    status_dirty        = 1;
+}
+
+/* Kill word backward (to previous word boundary) → undelete slot.   */
+static void command_kill_word_backward(void)
+{
+    Line *l   = &lines[cur_row];
+    int   pos = cur_col;
+    int   start, len, i;
+
+    if (pos == 0) return;
+
+    while (pos > 0 && l->buf[pos - 1] == ' ') pos--;
+    while (pos > 0 && l->buf[pos - 1] != ' ') pos--;
+
+    start = pos;
+    len   = cur_col - start;
+    if (len <= 0) return;
+
+    undel_was_insert = ins_mode;
+    if (len < UNDEL_MAX) {
+        memcpy(undel_text,    l->buf + start, (size_t)len);
+        memcpy(undel_fmt_buf, l->fmt + start, (size_t)len);
+        undel_len    = len;
+        undel_active = 1;
+    }
+
+    if (ins_mode) {
+        for (i = 0; i < len; i++)
+            line_del(l, start);
+    } else {
+        ovr_blank_range(cur_row, start, len);
+    }
+
+    cur_col             = start;
+    line_dirty[cur_row] = 1;
+    modified            = 1;
+    content_dirty       = 1;
+    status_dirty        = 1;
+}
+
+/* Kill word forward (to next word boundary) → undelete slot.        */
+static void command_kill_word_forward(void)
+{
+    Line *l   = &lines[cur_row];
+    int   pos = cur_col;
+    int   len, i;
+
+    if (pos >= l->len) return;
+
+    while (pos < l->len && l->buf[pos] != ' ') pos++;
+    while (pos < l->len && l->buf[pos] == ' ') pos++;
+
+    len = pos - cur_col;
+    if (len <= 0) return;
+
+    undel_was_insert = ins_mode;
+    if (len < UNDEL_MAX) {
+        memcpy(undel_text,    l->buf + cur_col, (size_t)len);
+        memcpy(undel_fmt_buf, l->fmt + cur_col, (size_t)len);
+        undel_len    = len;
+        undel_active = 1;
+    }
+
+    if (ins_mode) {
+        for (i = 0; i < len; i++)
+            line_del(l, cur_col);
+    } else {
+        ovr_blank_range(cur_row, cur_col, len);
+    }
+
+    line_dirty[cur_row] = 1;
+    modified            = 1;
+    content_dirty       = 1;
+    status_dirty        = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -540,6 +928,21 @@ static void draw_status(void)
     int page = cur_row / page_len + 1;
     int line = cur_row % page_len + 1;
     int col  = cur_col + 1;
+
+    if (mark_state.mode != MARK_NONE && !console_state.active) {
+        vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
+        vio_clrline(VGA_ROWS - 1, VGA_ATTR(VGA_CYAN, VGA_BLACK));
+        vio_gotoxy(0, VGA_ROWS - 1);
+        if (mark_state.mode == MARK_CTRL_K)
+            vio_puts("[^K] second mark   [ESC] cancel");
+        else
+            vio_puts("[F1] kill   [ESC] cancel");
+        vio_gotoxy(55, VGA_ROWS - 1);
+        vio_puts("Pg "); vio_uint(page, 3);
+        vio_puts(" Ln "); vio_uint(line, 4);
+        status_dirty = 0;
+        return;
+    }
 
     if (console_state.active) {
         int i;
@@ -703,7 +1106,10 @@ static void draw_content(void)
                     }
 
                     vio_putch_at(c, screen_row,
-                                 (uint8_t)lines[lr].buf[c], attr);
+                                 (uint8_t)lines[lr].buf[c],
+                                 mark_cell_selected(lr, c)
+                                     ? (uint8_t)((attr << 4) | (attr >> 4))
+                                     : attr);
                     if (fplane)
                         fplane[screen_row * VGA_COLS + c] = slot;
                     if (uplane)
@@ -2547,7 +2953,11 @@ static void handle_key(int ch)
     switch (ch) {
 
     case KEY_ESC:
-        console_enter();
+        if (mark_state.mode != MARK_NONE) {
+            mark_clear();
+        } else {
+            console_enter();
+        }
         break;
 
     case KEY_CTRL('q'):
@@ -2608,6 +3018,7 @@ static void handle_key(int ch)
 
     /* Movement ------------------------------------------------------ */
     case KEY_UP:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         if (cur_row > 0) {
             cur_row--;
             /* If we landed in page-break padding, snap up to the marker */
@@ -2625,6 +3036,7 @@ static void handle_key(int ch)
         break;
 
     case KEY_DOWN:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         if (cur_row < nlines - 1) {
             int was_break = line_flags[cur_row] & LINE_FLAG_PAGE_BREAK;
             cur_row++;
@@ -2642,6 +3054,7 @@ static void handle_key(int ch)
         break;
 
     case KEY_LEFT:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         if (cur_col > 0) {
             cur_col--;
             status_dirty = 1;
@@ -2654,6 +3067,7 @@ static void handle_key(int ch)
         break;
 
     case KEY_RIGHT:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         if (cur_col < lines[cur_row].len) {
             cur_col++;
             status_dirty = 1;
@@ -2697,6 +3111,66 @@ static void handle_key(int ch)
         status_dirty = 1;
         break;
 
+    /* Mark ---------------------------------------------------------- */
+    case KEY_CTRL('k'):
+        if (mark_state.mode == MARK_NONE || mark_state.mode == MARK_DEFINED) {
+            /* Drop a fresh anchor */
+            mark_state.anchor_row = cur_row;
+            mark_state.anchor_col = cur_col;
+            mark_state.mode = MARK_CTRL_K;
+            mark_visible_dirty();
+        } else {
+            /* Second Ctrl+K closes the region */
+            mark_state.mode = MARK_DEFINED;
+            mark_visible_dirty();
+        }
+        status_dirty = 1;
+        break;
+
+    case KEY_SHIFT_UP:
+    case KEY_SHIFT_DOWN:
+    case KEY_SHIFT_LEFT:
+    case KEY_SHIFT_RIGHT:
+        /* Start over from current cursor regardless of prior mark     */
+        mark_state.anchor_row = cur_row;
+        mark_state.anchor_col = cur_col;
+        mark_state.mode = MARK_DEFINED;
+        /* Move cursor one step */
+        if (ch == KEY_SHIFT_UP && cur_row > 0) {
+            cur_row--; clamp_col();
+        } else if (ch == KEY_SHIFT_DOWN && cur_row < nlines - 1) {
+            cur_row++; clamp_col();
+        } else if (ch == KEY_SHIFT_LEFT) {
+            if (cur_col > 0) cur_col--;
+        } else if (ch == KEY_SHIFT_RIGHT) {
+            if (cur_col < lines[cur_row].len) cur_col++;
+        }
+        ensure_visible();
+        mark_visible_dirty();
+        status_dirty = 1;
+        break;
+
+    case KEY_F1:
+        if (mark_state.mode == MARK_DEFINED)
+            command_kill_mark();
+        break;
+
+    case KEY_F4:
+        command_undelete();
+        break;
+
+    case KEY_CTRL('y'):
+        command_kill_line();
+        break;
+
+    case KEY_CTRL_BS:
+        command_kill_word_backward();
+        break;
+
+    case KEY_CTRL_DEL:
+        command_kill_word_forward();
+        break;
+
     /* Newline -------------------------------------------------------- */
     case KEY_ENTER:
         if (nlines >= MAX_LINES) {
@@ -2726,52 +3200,86 @@ static void handle_key(int ch)
 
     /* Backspace ------------------------------------------------------ */
     case KEY_BS:
-        if (cur_col > 0) {
-            undo_push_del_char(cur_row, cur_col - 1);
-            cur_col--;
-            line_del(&lines[cur_row], cur_col);
-            line_dirty[cur_row] = 1;
-            modified = 1;
-            content_dirty = 1;
-            status_dirty = 1;
-        } else if (cur_row > 0) {
-            int prev_len = lines[cur_row - 1].len;
-            undo_push_join(cur_row - 1, prev_len);
-            join_lines(cur_row - 1);
-            line_dirty[cur_row - 1] = 1;
-            mark_visible_dirty();
-            modified = 1;
-            cur_row--;
-            cur_col = prev_len;
-            content_dirty = 1;
-            status_dirty = 1;
-            ensure_visible();
+        if (!ins_mode) {
+            /* OVR: move left, blank that cell, stay there           */
+            if (cur_col > 0) {
+                cur_col--;
+                if (cur_col < lines[cur_row].len) {
+                    undo_push_ovr_blank(cur_row, cur_col);
+                    lines[cur_row].buf[cur_col] = ' ';
+                    lines[cur_row].fmt[cur_col] = 0;
+                    line_dirty[cur_row] = 1;
+                    modified      = 1;
+                    content_dirty = 1;
+                    status_dirty  = 1;
+                }
+            }
+            /* at col 0 in OVR: stop, do not join lines             */
+        } else {
+            /* INS: collapse                                         */
+            if (cur_col > 0) {
+                undo_push_del_char(cur_row, cur_col - 1);
+                cur_col--;
+                line_del(&lines[cur_row], cur_col);
+                line_dirty[cur_row] = 1;
+                modified      = 1;
+                content_dirty = 1;
+                status_dirty  = 1;
+            } else if (cur_row > 0) {
+                int prev_len = lines[cur_row - 1].len;
+                undo_push_join(cur_row - 1, prev_len);
+                join_lines(cur_row - 1);
+                line_dirty[cur_row - 1] = 1;
+                mark_visible_dirty();
+                modified = 1;
+                cur_row--;
+                cur_col       = prev_len;
+                content_dirty = 1;
+                status_dirty  = 1;
+                ensure_visible();
+            }
         }
         break;
 
     /* Delete --------------------------------------------------------- */
     case KEY_DEL:
-        if (cur_col < lines[cur_row].len) {
-            undo_push_del_char(cur_row, cur_col);
-            line_del(&lines[cur_row], cur_col);
-            line_dirty[cur_row] = 1;
-            modified = 1;
-            content_dirty = 1;
-            status_dirty = 1;
-        } else if (cur_row < nlines - 1) {
-            undo_push_join(cur_row, lines[cur_row].len);
-            join_lines(cur_row);
-            line_dirty[cur_row] = 1;
-            mark_visible_dirty();
-            modified = 1;
-            content_dirty = 1;
-            status_dirty = 1;
+        if (!ins_mode) {
+            /* OVR: blank cell in place, cursor stays                */
+            if (cur_col < lines[cur_row].len) {
+                undo_push_ovr_blank(cur_row, cur_col);
+                lines[cur_row].buf[cur_col] = ' ';
+                lines[cur_row].fmt[cur_col] = 0;
+                line_dirty[cur_row] = 1;
+                modified      = 1;
+                content_dirty = 1;
+                status_dirty  = 1;
+            }
+            /* at end of line in OVR: stop, do not join lines       */
+        } else {
+            /* INS: collapse                                         */
+            if (cur_col < lines[cur_row].len) {
+                undo_push_del_char(cur_row, cur_col);
+                line_del(&lines[cur_row], cur_col);
+                line_dirty[cur_row] = 1;
+                modified      = 1;
+                content_dirty = 1;
+                status_dirty  = 1;
+            } else if (cur_row < nlines - 1) {
+                undo_push_join(cur_row, lines[cur_row].len);
+                join_lines(cur_row);
+                line_dirty[cur_row] = 1;
+                mark_visible_dirty();
+                modified      = 1;
+                content_dirty = 1;
+                status_dirty  = 1;
+            }
         }
         break;
 
     /* Printable ------------------------------------------------------ */
     default:
         if (ch >= 32 && ch <= 255) {
+            if (mark_state.mode != MARK_NONE) mark_clear();
             insert_printable(ch);
         }
         break;
