@@ -123,6 +123,8 @@ static unsigned char undel_fmt_buf[UNDEL_MAX];
 static int           undel_len        = 0;
 static int           undel_active     = 0;
 static int           undel_was_insert = 1;  /* 0 = OVR blank, 1 = INS collapse */
+static int           undel_row        = 0;  /* origin row of last kill          */
+static int           undel_col        = 0;  /* origin col of last kill          */
 
 static Line lines[MAX_LINES];
 static int  nlines = 1;
@@ -378,6 +380,21 @@ static void set_console_error(const char *msg)
     status_dirty = 1;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Status bar notification — shown without opening the console.      */
+/*  Clears automatically on the next keypress.                        */
+/* ------------------------------------------------------------------ */
+static char notify_buf[80];
+static int  notify_active = 0;
+
+static void set_notify(const char *msg)
+{
+    strncpy(notify_buf, msg, sizeof(notify_buf) - 1);
+    notify_buf[sizeof(notify_buf) - 1] = '\0';
+    notify_active = 1;
+    status_dirty  = 1;
+}
+
 static void mark_visible_dirty(void)
 {
     int r;
@@ -427,165 +444,6 @@ static void ensure_visible(void)
 /*  Undo system                                                        */
 /* ------------------------------------------------------------------ */
 
-#define UNDO_MAX 512
-
-typedef enum {
-    UNDO_INS_CHAR,   /* undo: delete char at (row,col)              */
-    UNDO_DEL_CHAR,   /* undo: insert char ch/fmt at (row,col)       */
-    UNDO_SPLIT,      /* undo: join lines[row] and lines[row+1]      */
-    UNDO_JOIN,       /* undo: split lines[row] at col               */
-    UNDO_OVR_BLANK   /* undo: restore ch/fmt at (row,col) in place  */
-} UndoType;
-
-typedef struct {
-    UndoType      type;
-    int           row, col;
-    char          ch;
-    unsigned char fmt_byte;
-    char          line_buf[VGA_COLS + 1];
-    unsigned char line_fmt[VGA_COLS];
-    int           line_len;
-} UndoRecord;
-
-static UndoRecord undo_stack[UNDO_MAX];
-static int        undo_top   = 0;
-static int        undo_count = 0;
-
-static UndoRecord *undo_push(void)
-{
-    UndoRecord *r = &undo_stack[undo_top];
-    undo_top = (undo_top + 1) % UNDO_MAX;
-    if (undo_count < UNDO_MAX) undo_count++;
-    return r;
-}
-
-static void undo_push_ins_char(void)
-{
-    UndoRecord *r = undo_push();
-    r->type = UNDO_INS_CHAR;
-    r->row  = cur_row;
-    r->col  = cur_col;
-}
-
-static void undo_push_del_char(int row, int col)
-{
-    UndoRecord *r = undo_push();
-    r->type     = UNDO_DEL_CHAR;
-    r->row      = row;
-    r->col      = col;
-    r->ch       = lines[row].buf[col];
-    r->fmt_byte = lines[row].fmt[col];
-}
-
-static void undo_push_split(void)
-{
-    UndoRecord *r = undo_push();
-    r->type = UNDO_SPLIT;
-    r->row  = cur_row;
-    r->col  = cur_col;
-}
-
-static void undo_push_join(int row, int split_col)
-{
-    UndoRecord *r  = undo_push();
-    Line       *l1 = &lines[row + 1];
-    int         tail = l1->len < VGA_COLS ? l1->len : VGA_COLS;
-    r->type     = UNDO_JOIN;
-    r->row      = row;
-    r->col      = split_col;
-    r->line_len = tail;
-    memcpy(r->line_buf, l1->buf, (size_t)tail);
-    r->line_buf[tail] = '\0';
-    memcpy(r->line_fmt, l1->fmt, (size_t)tail);
-}
-
-/* Record an overwrite-blank so Ctrl+Z can restore the original char. */
-static void undo_push_ovr_blank(int row, int col)
-{
-    UndoRecord *r = undo_push();
-    r->type     = UNDO_OVR_BLANK;
-    r->row      = row;
-    r->col      = col;
-    r->ch       = (col < lines[row].len) ? lines[row].buf[col] : ' ';
-    r->fmt_byte = (col < lines[row].len) ? lines[row].fmt[col] : 0;
-}
-
-static void do_undo(void)
-{
-    UndoRecord *r;
-
-    if (undo_count == 0) {
-        set_console_error("nothing to undo");
-        return;
-    }
-
-    undo_top = (undo_top - 1 + UNDO_MAX) % UNDO_MAX;
-    undo_count--;
-    r = &undo_stack[undo_top];
-
-    switch (r->type) {
-
-    case UNDO_INS_CHAR:
-        cur_row = r->row;
-        cur_col = r->col;
-        if (cur_col < lines[cur_row].len) {
-            line_del(&lines[cur_row], cur_col);
-            line_dirty[cur_row] = 1;
-        }
-        break;
-
-    case UNDO_DEL_CHAR:
-        cur_row = r->row;
-        cur_col = r->col;
-        line_ins(&lines[cur_row], cur_col, r->ch, r->fmt_byte);
-        line_dirty[cur_row] = 1;
-        break;
-
-    case UNDO_SPLIT:
-        cur_row = r->row;
-        cur_col = r->col;
-        if (cur_row + 1 < nlines) {
-            join_lines(cur_row);
-            line_dirty[cur_row] = 1;
-            mark_visible_dirty();
-        }
-        break;
-
-    case UNDO_JOIN:
-        cur_row = r->row;
-        cur_col = r->col;
-        split_line(cur_row, r->col);
-        if (cur_row + 1 < nlines) {
-            Line *l = &lines[cur_row + 1];
-            line_grow(l, r->line_len);
-            memcpy(l->buf, r->line_buf, (size_t)r->line_len);
-            l->buf[r->line_len] = '\0';
-            memcpy(l->fmt, r->line_fmt, (size_t)r->line_len);
-            l->len = r->line_len;
-            line_dirty[cur_row + 1] = 1;
-        }
-        line_dirty[cur_row] = 1;
-        mark_visible_dirty();
-        break;
-
-    case UNDO_OVR_BLANK:
-        /* Restore original char in place — no shifting.             */
-        cur_row = r->row;
-        cur_col = r->col;
-        if (cur_col < lines[cur_row].len) {
-            lines[cur_row].buf[cur_col] = r->ch;
-            lines[cur_row].fmt[cur_col] = r->fmt_byte;
-            line_dirty[cur_row] = 1;
-        }
-        break;
-    }
-
-    modified      = 1;
-    status_dirty  = 1;
-    content_dirty = 1;
-    ensure_visible();
-}
-
 /* ------------------------------------------------------------------ */
 /*  Mark helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -611,14 +469,16 @@ static int mark_cell_selected(int lr, int c)
     mark_region_bounds(&sr, &sc, &er, &ec);
     if (lr < sr || lr > er) return 0;
     if (lr == sr && c < sc) return 0;
-    if (lr == er && c >= ec) return 0;
+    if (lr == er && c > ec) return 0;   /* ec is now inclusive        */
     return 1;
 }
 
 /* Clear mark and force full visible redraw.                          */
 static void mark_clear(void)
 {
-    mark_state.mode = MARK_NONE;
+    mark_state.mode       = MARK_NONE;
+    mark_state.anchor_row = 0;
+    mark_state.anchor_col = 0;
     mark_visible_dirty();
     status_dirty  = 1;
     content_dirty = 1;
@@ -663,7 +523,7 @@ static void command_kill_mark(void)
     undel_len = 0;
 
     if (sr == er) {
-        int len = ec - sc;
+        int len = ec - sc + 1;                   /* ec is inclusive   */
         if (len > 0 && len < UNDEL_MAX) {
             memcpy(undel_text    + undel_len, lines[sr].buf + sc, (size_t)len);
             memcpy(undel_fmt_buf + undel_len, lines[sr].fmt + sc, (size_t)len);
@@ -696,33 +556,38 @@ static void command_kill_mark(void)
                 undel_len++;
             }
         }
-        /* Last line: 0 to ec */
-        if (ec > 0 && undel_len + ec < UNDEL_MAX) {
-            memcpy(undel_text    + undel_len, lines[er].buf, (size_t)ec);
-            memcpy(undel_fmt_buf + undel_len, lines[er].fmt, (size_t)ec);
-            undel_len += ec;
+        /* Last line: 0 to ec inclusive                              */
+        {
+            int elen = ec + 1;
+            if (elen > 0 && undel_len + elen < UNDEL_MAX) {
+                memcpy(undel_text    + undel_len, lines[er].buf, (size_t)elen);
+                memcpy(undel_fmt_buf + undel_len, lines[er].fmt, (size_t)elen);
+                undel_len += elen;
+            }
         }
     }
     undel_active     = (undel_len > 0);
     undel_was_insert = ins_mode;
+    undel_row        = sr;           /* cursor lands here after kill */
+    undel_col        = sc;
 
     /* --- Delete content from buffer ------------------------------ */
     if (!ins_mode) {
         /* OVR: blank region with spaces, geometry unchanged          */
         if (sr == er) {
-            ovr_blank_range(sr, sc, ec - sc);
+            ovr_blank_range(sr, sc, ec - sc + 1);   /* inclusive     */
         } else {
             ovr_blank_range(sr, sc, lines[sr].len - sc);
             for (r = sr + 1; r < er; r++)
                 ovr_blank_range(r, 0, lines[r].len);
-            ovr_blank_range(er, 0, ec);
+            ovr_blank_range(er, 0, ec + 1);          /* inclusive     */
         }
         cur_row = sr;
         cur_col = sc;
     } else {
-        /* INS: collapse — existing logic                             */
+        /* INS: collapse                                              */
         if (sr == er) {
-            int count = ec - sc;
+            int count = ec - sc + 1;             /* inclusive        */
             for (i = 0; i < count; i++)
                 line_del(&lines[sr], sc);
             line_dirty[sr] = 1;
@@ -731,7 +596,7 @@ static void command_kill_mark(void)
             line_dirty[sr] = 1;
             for (r = er - 1; r > sr; r--)
                 delete_line(r);
-            for (i = 0; i < ec; i++)
+            for (i = 0; i <= ec; i++)            /* inclusive        */
                 line_del(&lines[sr + 1], 0);
             line_dirty[sr + 1] = 1;
             join_lines(sr);
@@ -752,7 +617,21 @@ static void command_kill_mark(void)
 static void command_undelete(void)
 {
     int i;
-    if (!undel_active || undel_len == 0) return;
+    if (!undel_active || undel_len == 0) {
+        set_notify("nothing to undelete");
+        return;
+    }
+
+    /* Return to the origin of the kill regardless of where the      */
+    /* cursor is now. Clamp in case document was edited since kill.  */
+    {
+        int tr = undel_row < nlines ? undel_row : nlines - 1;
+        int tc = undel_col;
+        if (tc > lines[tr].len) tc = lines[tr].len;
+        cur_row = tr;
+        cur_col = tc;
+        ensure_visible();
+    }
 
     if (!undel_was_insert) {
         /* OVR kill: overwrite spaces back with original content     */
@@ -768,7 +647,6 @@ static void command_undelete(void)
             } else {
                 Line *l = &lines[cur_row];
                 if (cur_col < l->len) {
-                    undo_push_ovr_blank(cur_row, cur_col);
                     l->buf[cur_col] = ch;
                     l->fmt[cur_col] = fmt;
                     line_dirty[cur_row] = 1;
@@ -786,7 +664,6 @@ static void command_undelete(void)
 
             if (ch == '\n') {
                 if (nlines < MAX_LINES) {
-                    undo_push_split();
                     split_line(cur_row, cur_col);
                     line_dirty[cur_row]     = 1;
                     line_dirty[cur_row + 1] = 1;
@@ -800,7 +677,6 @@ static void command_undelete(void)
                 if (cur_col < tabs.left_page)      cur_col = tabs.left_page;
                 if (cur_col > tabs.right_page + 1) cur_col = tabs.right_page + 1;
                 line_pad_to(l, cur_col);
-                undo_push_ins_char();
                 line_ins(l, cur_col, ch, fmt);
                 line_dirty[cur_row] = 1;
                 cur_col++;
@@ -813,6 +689,13 @@ static void command_undelete(void)
 
     ensure_visible();
     status_dirty = 1;
+
+    /* Slot is consumed — clear it so Ctrl+Z can't re-fire           */
+    undel_active     = 0;
+    undel_len        = 0;
+    undel_row        = 0;
+    undel_col        = 0;
+    undel_was_insert = 1;
 }
 
 /* Kill current line content → undelete slot. Line stays (empty).    */
@@ -824,6 +707,8 @@ static void command_kill_line(void)
     undel_len        = 0;
     undel_active     = 0;
     undel_was_insert = ins_mode;
+    undel_row        = cur_row;
+    undel_col        = 0;
 
     if (len > 0 && len < UNDEL_MAX) {
         memcpy(undel_text,    l->buf, (size_t)len);
@@ -863,6 +748,8 @@ static void command_kill_word_backward(void)
     if (len <= 0) return;
 
     undel_was_insert = ins_mode;
+    undel_row        = cur_row;
+    undel_col        = start;        /* cursor will land here after kill */
     if (len < UNDEL_MAX) {
         memcpy(undel_text,    l->buf + start, (size_t)len);
         memcpy(undel_fmt_buf, l->fmt + start, (size_t)len);
@@ -900,6 +787,8 @@ static void command_kill_word_forward(void)
     if (len <= 0) return;
 
     undel_was_insert = ins_mode;
+    undel_row        = cur_row;
+    undel_col        = cur_col;      /* cursor stays here after kill */
     if (len < UNDEL_MAX) {
         memcpy(undel_text,    l->buf + cur_col, (size_t)len);
         memcpy(undel_fmt_buf, l->fmt + cur_col, (size_t)len);
@@ -928,6 +817,22 @@ static void draw_status(void)
     int page = cur_row / page_len + 1;
     int line = cur_row % page_len + 1;
     int col  = cur_col + 1;
+
+    if (notify_active && !console_state.active) {
+        int i;
+        vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
+        vio_clrline(VGA_ROWS - 1, VGA_ATTR(VGA_CYAN, VGA_BLACK));
+        vio_gotoxy(1, VGA_ROWS - 1);
+        for (i = 0; notify_buf[i] && i < 50; i++)
+            vio_putch((unsigned char)notify_buf[i]);
+        /* Pg/Ln on right so writer keeps orientation               */
+        vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
+        vio_gotoxy(55, VGA_ROWS - 1);
+        vio_puts("Pg "); vio_uint(page, 3);
+        vio_puts(" Ln "); vio_uint(line, 4);
+        status_dirty = 0;
+        return;
+    }
 
     if (mark_state.mode != MARK_NONE && !console_state.active) {
         vio_setattr(VGA_ATTR(VGA_CYAN, VGA_BLACK));
@@ -1107,7 +1012,8 @@ static void draw_content(void)
 
                     vio_putch_at(c, screen_row,
                                  (uint8_t)lines[lr].buf[c],
-                                 mark_cell_selected(lr, c)
+                                 (mark_cell_selected(lr, c) &&
+                                  !(lr == cur_row && c == cur_col))
                                      ? (uint8_t)((attr << 4) | (attr >> 4))
                                      : attr);
                     if (fplane)
@@ -1981,7 +1887,6 @@ static void insert_printable(int ch)
         cur_col = tabs.right_page + 1;
 
     line_pad_to(l, cur_col);
-    undo_push_ins_char();
     if (ins_mode) {
         line_ins(l, cur_col, (char)ch, (unsigned char)cur_fmt);
     } else {
@@ -2945,6 +2850,12 @@ static void handle_key(int ch)
         return;
     }
 
+    /* Any keypress dismisses a status notification                   */
+    if (notify_active) {
+        notify_active = 0;
+        status_dirty  = 1;
+    }
+
     if (console_state.active) {
         handle_console_key(ch);
         return;
@@ -2966,7 +2877,7 @@ static void handle_key(int ch)
 
     case KEY_CTRL('s'):
         if (do_save() < 0 && !console_state.has_error)
-            set_console_error("save failed");
+            set_notify("save failed");
         break;
 
     case KEY_CTRL('n'):
@@ -2994,7 +2905,7 @@ static void handle_key(int ch)
         break;
 
     case KEY_CTRL('z'):
-        do_undo();
+        command_undelete();
         break;
 
     case KEY_CTRL('g'):
@@ -3080,16 +2991,19 @@ static void handle_key(int ch)
         break;
 
     case KEY_HOME:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         cur_col = tabs.left_tab;
         status_dirty = 1;
         break;
 
     case KEY_END:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         cur_col = lines[cur_row].len;
         status_dirty = 1;
         break;
 
     case KEY_PGUP:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         cur_row -= EDIT_ROWS - 1;
         if (cur_row < 0) cur_row = 0;
         clamp_col();
@@ -3098,6 +3012,7 @@ static void handle_key(int ch)
         break;
 
     case KEY_PGDN:
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
         cur_row += EDIT_ROWS - 1;
         if (cur_row >= nlines) cur_row = nlines - 1;
         clamp_col();
@@ -3127,57 +3042,32 @@ static void handle_key(int ch)
         status_dirty = 1;
         break;
 
-    case KEY_SHIFT_UP:
-    case KEY_SHIFT_DOWN:
-    case KEY_SHIFT_LEFT:
-    case KEY_SHIFT_RIGHT:
-        /* Start over from current cursor regardless of prior mark     */
-        mark_state.anchor_row = cur_row;
-        mark_state.anchor_col = cur_col;
-        mark_state.mode = MARK_DEFINED;
-        /* Move cursor one step */
-        if (ch == KEY_SHIFT_UP && cur_row > 0) {
-            cur_row--; clamp_col();
-        } else if (ch == KEY_SHIFT_DOWN && cur_row < nlines - 1) {
-            cur_row++; clamp_col();
-        } else if (ch == KEY_SHIFT_LEFT) {
-            if (cur_col > 0) cur_col--;
-        } else if (ch == KEY_SHIFT_RIGHT) {
-            if (cur_col < lines[cur_row].len) cur_col++;
-        }
-        ensure_visible();
-        mark_visible_dirty();
-        status_dirty = 1;
-        break;
-
-    case KEY_F1:
-        if (mark_state.mode == MARK_DEFINED)
-            command_kill_mark();
-        break;
-
-    case KEY_F4:
-        command_undelete();
-        break;
-
     case KEY_CTRL('y'):
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         command_kill_line();
         break;
 
     case KEY_CTRL_BS:
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         command_kill_word_backward();
         break;
 
     case KEY_CTRL_DEL:
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         command_kill_word_forward();
         break;
 
     /* Newline -------------------------------------------------------- */
     case KEY_ENTER:
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         if (nlines >= MAX_LINES) {
-            set_console_error("maximum lines reached");
+            set_notify("maximum lines reached");
             break;
         }
-        undo_push_split();
         split_line(cur_row, cur_col);
         line_dirty[cur_row] = 1;
         line_dirty[cur_row + 1] = 1;
@@ -3194,18 +3084,21 @@ static void handle_key(int ch)
 
     case KEY_TAB: {
         int i;
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         for (i = 0; i < tabs.tab_size; i++) insert_printable(' ');
         break;
     }
 
     /* Backspace ------------------------------------------------------ */
     case KEY_BS:
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         if (!ins_mode) {
             /* OVR: move left, blank that cell, stay there           */
             if (cur_col > 0) {
                 cur_col--;
                 if (cur_col < lines[cur_row].len) {
-                    undo_push_ovr_blank(cur_row, cur_col);
                     lines[cur_row].buf[cur_col] = ' ';
                     lines[cur_row].fmt[cur_col] = 0;
                     line_dirty[cur_row] = 1;
@@ -3218,7 +3111,6 @@ static void handle_key(int ch)
         } else {
             /* INS: collapse                                         */
             if (cur_col > 0) {
-                undo_push_del_char(cur_row, cur_col - 1);
                 cur_col--;
                 line_del(&lines[cur_row], cur_col);
                 line_dirty[cur_row] = 1;
@@ -3227,7 +3119,6 @@ static void handle_key(int ch)
                 status_dirty  = 1;
             } else if (cur_row > 0) {
                 int prev_len = lines[cur_row - 1].len;
-                undo_push_join(cur_row - 1, prev_len);
                 join_lines(cur_row - 1);
                 line_dirty[cur_row - 1] = 1;
                 mark_visible_dirty();
@@ -3243,10 +3134,11 @@ static void handle_key(int ch)
 
     /* Delete --------------------------------------------------------- */
     case KEY_DEL:
+        if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
         if (!ins_mode) {
             /* OVR: blank cell in place, cursor stays                */
             if (cur_col < lines[cur_row].len) {
-                undo_push_ovr_blank(cur_row, cur_col);
                 lines[cur_row].buf[cur_col] = ' ';
                 lines[cur_row].fmt[cur_col] = 0;
                 line_dirty[cur_row] = 1;
@@ -3258,14 +3150,12 @@ static void handle_key(int ch)
         } else {
             /* INS: collapse                                         */
             if (cur_col < lines[cur_row].len) {
-                undo_push_del_char(cur_row, cur_col);
                 line_del(&lines[cur_row], cur_col);
                 line_dirty[cur_row] = 1;
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
             } else if (cur_row < nlines - 1) {
-                undo_push_join(cur_row, lines[cur_row].len);
                 join_lines(cur_row);
                 line_dirty[cur_row] = 1;
                 mark_visible_dirty();
@@ -3279,7 +3169,8 @@ static void handle_key(int ch)
     /* Printable ------------------------------------------------------ */
     default:
         if (ch >= 32 && ch <= 255) {
-            if (mark_state.mode != MARK_NONE) mark_clear();
+            if (mark_state.mode == MARK_DEFINED) mark_clear();
+            if (mark_state.mode == MARK_CTRL_K)  mark_clear();
             insert_printable(ch);
         }
         break;

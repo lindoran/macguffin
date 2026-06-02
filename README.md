@@ -125,6 +125,7 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 | Ctrl-F           | Open console with `find ` typed                 |
 | Ctrl-G           | Repeat previous find                            |
 | Ctrl-R           | Arm current header/footer as repeating template |
+| Ctrl-Z           | Undelete (restore last killed to its origin)    |
 | Ctrl-K           | Drop mark anchor / close mark region            |
 | Ctrl-Y           | Kill current line → undelete slot                |
 | Ctrl-Backspace   | Kill word backward → undelete slot              |
@@ -133,14 +134,11 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 | Tab              | Insert current tab size spaces                  |
 | Insert           | Toggle INS / OVR                                |
 | Arrows           | Move cursor (clears defined mark)               |
-| Shift+Arrows     | Start / extend mark selection                   |
 | Home / End       | Left tab / end of line                          |
 | PgUp / PgDn      | Scroll a screenful                              |
-| Enter            | Split line                                      |
+| Enter            | Split line (kills mark if defined)              |
 | Backspace        | INS: collapse left / OVR: move left, blank cell |
 | Delete           | INS: collapse right / OVR: blank cell in place  |
-| F1               | Kill marked region → undelete slot               |
-| F4               | Undelete (restore last killed)                  |
 
 Characters 32–255 are passed straight through as CP437 glyphs.
 
@@ -148,13 +146,11 @@ Characters 32–255 are passed straight through as CP437 glyphs.
 
 Macguffin uses a **mark and kill** model rather than a conventional clipboard. This fits the fixed-geometry editing philosophy: operations are intentional and permanent, with a single-slot undelete buffer for immediate recovery.
 
-### Two ways to define a region
+### Defining a region
 
-**Shift+arrow** — for small selections. Hold Shift and press an arrow key to start a mark at the current cursor position and extend it one step. Continue holding Shift and arrowing to extend further. Plain arrow cancels the mark. If a mark was already defined, Shift+arrow starts a fresh mark from the current cursor position.
+Press **Ctrl+K** to drop an anchor at the cursor. The status bar shows `[^K] second mark  [ESC] cancel`. Navigate freely with plain arrows — the mark stays active. Press **Ctrl+K** again to close the region; the status bar changes to `[F1] kill  [ESC] cancel`. The marked region is shown inverted on screen. **ESC** cancels at any point without killing.
 
-**Ctrl+K...Ctrl+K** — for larger blocks. First Ctrl+K drops an anchor at the cursor; the status bar shows `[^K] second mark  [ESC] cancel`. Navigate freely with plain arrows — the mark stays. Second Ctrl+K closes the region; the status bar changes to `[F1] kill  [ESC] cancel`. ESC at any point cancels without killing.
-
-Both paths arrive at the same defined region, shown inverted on screen.
+Plain arrows clear a defined mark and move normally. Typing a character also clears the mark.
 
 ### INS and OVR mode affect all delete operations
 
@@ -181,19 +177,23 @@ All kill operations (F1, Ctrl+Y, Ctrl+Backspace, Ctrl+Delete) store the killed c
 
 | Key            | What is killed                          |
 |----------------|-----------------------------------------|
-| F1             | Defined marked region                   |
+| BS / Del       | Defined marked region (when mark active)|
 | Ctrl+Y         | Current line content (line stays empty) |
 | Ctrl+Backspace | Word before cursor                      |
 | Ctrl+Delete    | Word after cursor                       |
 
-### Undelete
+### Undelete (Ctrl+Z)
 
-**F4** restores the last killed content at the cursor position, preserving the original character formatting. Undelete is the inverse of the kill that produced it:
+**Ctrl+Z** restores the last killed content to its exact origin. The editor remembers where the kill happened and navigates back there before restoring — you can move the cursor freely between the kill and Ctrl+Z and it will still land in the right place.
 
-- If the kill was done in **INS mode**: F4 re-inserts the content, shifting existing content open. Obeys tab stops and wraps identically to typing. Each restored character is recorded in the undo ring.
-- If the kill was done in **OVR mode**: F4 overwrites from the cursor position with the original characters, restoring them in place without shifting anything.
+Undelete is the inverse of the kill that produced it:
+
+- If the kill was done in **INS mode**: Ctrl+Z re-inserts the content, shifting existing content open. Obeys tab stops and wraps identically to typing.
+- If the kill was done in **OVR mode**: Ctrl+Z overwrites from the origin position with the original characters, restoring them in place without shifting anything.
 
 The mode at kill time is remembered automatically — you do not need to be in the same mode when you undelete.
+
+There is no character-level undo. Backspace and Delete are permanent for individual characters. For word and region recovery, use the kill operations and Ctrl+Z.
 
 ## Spell Check
 
