@@ -3110,13 +3110,34 @@ static void handle_key(int ch)
             /* at col 0 in OVR: stop, do not join lines             */
         } else {
             /* INS: collapse                                         */
-            if (cur_col > 0) {
+            if (cur_col > tabs.left_tab) {
                 cur_col--;
                 line_del(&lines[cur_row], cur_col);
                 line_dirty[cur_row] = 1;
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
+            } else if (cur_col > 0) {
+                /* Between col 0 and left_tab: strip leading indent  *
+                 * spaces then fall through to join with prev line.  */
+                while (lines[cur_row].len > 0 &&
+                       cur_col > 0 &&
+                       lines[cur_row].buf[0] == ' ') {
+                    line_del(&lines[cur_row], 0);
+                    cur_col--;
+                }
+                if (cur_row > 0) {
+                    int prev_len = lines[cur_row - 1].len;
+                    join_lines(cur_row - 1);
+                    line_dirty[cur_row - 1] = 1;
+                    mark_visible_dirty();
+                    modified = 1;
+                    cur_row--;
+                    cur_col       = prev_len;
+                    content_dirty = 1;
+                    status_dirty  = 1;
+                    ensure_visible();
+                }
             } else if (cur_row > 0) {
                 int prev_len = lines[cur_row - 1].len;
                 join_lines(cur_row - 1);
