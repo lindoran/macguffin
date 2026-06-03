@@ -131,10 +131,254 @@ static int  nlines = 1;
 static unsigned char line_flags[MAX_LINES];
 
 static void mark_visible_dirty(void);
+static void mark_region_bounds(int *sr, int *sc, int *er, int *ec);
+static void handle_key(int ch);
 
 /* ------------------------------------------------------------------ */
-/*  Line helpers                                                       */
+/*  Unicode -> CP437 translation for paste                             */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Sorted table of Unicode codepoints that have a direct CP437 equivalent
+ * in the 0x80-0xFF range.  ASCII (0x20-0x7E) maps 1:1 and is handled
+ * separately.  Build with the canonical IBM CP437 glyph map.
+ */
+typedef struct { unsigned int unicode; unsigned char cp437; } UniMap;
+
+static const UniMap uni_to_cp437[] = {
+    {0x00A0,0xFF},{0x00A1,0xAD},{0x00A2,0x9B},{0x00A3,0x9C},{0x00A5,0x9D},
+    {0x00AA,0xA6},{0x00AB,0xAE},{0x00AC,0xAA},{0x00B0,0xF8},{0x00B1,0xF1},
+    {0x00B2,0xFD},{0x00B5,0xE6},{0x00B7,0xFA},{0x00BA,0xA7},{0x00BB,0xAF},
+    {0x00BC,0xAC},{0x00BD,0xAB},{0x00BF,0xA8},{0x00C4,0x8E},{0x00C5,0x8F},
+    {0x00C6,0x92},{0x00C7,0x80},{0x00C9,0x90},{0x00D1,0xA5},{0x00D6,0x99},
+    {0x00DC,0x9A},{0x00DF,0xE1},{0x00E0,0x85},{0x00E1,0xA0},{0x00E2,0x83},
+    {0x00E4,0x84},{0x00E5,0x86},{0x00E6,0x91},{0x00E7,0x87},{0x00E8,0x8A},
+    {0x00E9,0x82},{0x00EA,0x88},{0x00EB,0x89},{0x00EC,0x8D},{0x00ED,0xA1},
+    {0x00EE,0x8C},{0x00EF,0x8B},{0x00F1,0xA4},{0x00F2,0x95},{0x00F3,0xA2},
+    {0x00F4,0x93},{0x00F6,0x94},{0x00F7,0xF6},{0x00F9,0x97},{0x00FA,0xA3},
+    {0x00FB,0x96},{0x00FC,0x81},{0x00FF,0x98},{0x0192,0x9F},{0x0393,0xE2},
+    {0x0398,0xE9},{0x03A3,0xE4},{0x03A6,0xE8},{0x03A9,0xEA},{0x03B1,0xE0},
+    {0x03B4,0xEB},{0x03B5,0xEE},{0x03C0,0xE3},{0x03C3,0xE5},{0x03C4,0xE7},
+    {0x03C6,0xED},{0x207F,0xFC},{0x20A7,0x9E},{0x2190,0x1B},{0x2191,0x18},
+    {0x2192,0x1A},{0x2193,0x19},{0x2219,0xF9},{0x221A,0xFB},{0x221E,0xEC},
+    {0x2229,0xEF},{0x2248,0xF7},{0x2261,0xF0},{0x2264,0xF3},{0x2265,0xF2},
+    {0x2310,0xA9},{0x2320,0xF4},{0x2321,0xF5},{0x2500,0xC4},{0x2502,0xB3},
+    {0x250C,0xDA},{0x2510,0xBF},{0x2514,0xC0},{0x2518,0xD9},{0x251C,0xC3},
+    {0x2524,0xB4},{0x252C,0xC2},{0x2534,0xC1},{0x253C,0xC5},{0x2550,0xCD},
+    {0x2551,0xBA},{0x2552,0xD5},{0x2553,0xD6},{0x2554,0xC9},{0x2555,0xB8},
+    {0x2556,0xB7},{0x2557,0xBB},{0x2558,0xD4},{0x2559,0xD3},{0x255A,0xC8},
+    {0x255B,0xBE},{0x255C,0xBD},{0x255D,0xBC},{0x255E,0xC6},{0x255F,0xC7},
+    {0x2560,0xCC},{0x2561,0xB5},{0x2562,0xB6},{0x2563,0xB9},{0x2564,0xD1},
+    {0x2565,0xD2},{0x2566,0xCB},{0x2567,0xCF},{0x2568,0xD0},{0x2569,0xCA},
+    {0x256A,0xD8},{0x256B,0xD7},{0x256C,0xCE},{0x2580,0xDF},{0x2584,0xDC},
+    {0x2588,0xDB},{0x258C,0xDD},{0x2590,0xDE},{0x2591,0xB0},{0x2592,0xB1},
+    {0x2593,0xB2},{0x25A0,0xFE},{0x263A,0x01},{0x263B,0x02},{0x263C,0x0F},
+    {0x2640,0x0C},{0x2642,0x0B},{0x2660,0x06},{0x2663,0x05},{0x2665,0x03},
+    {0x2666,0x04},{0x266A,0x0D},{0x266B,0x0E}
+};
+#define UNI_MAP_LEN (int)(sizeof(uni_to_cp437)/sizeof(uni_to_cp437[0]))
+
+/*
+ * Decode one UTF-8 sequence from s[0..max-1].
+ * Returns the codepoint and advances *consumed by the byte count used.
+ * Returns 0xFFFD on bad sequences.
+ */
+static unsigned int utf8_decode(const unsigned char *s, int max, int *consumed)
+{
+    unsigned int cp;
+    int n;
+    if (max <= 0) { *consumed = 0; return 0; }
+    if (s[0] < 0x80) { *consumed = 1; return s[0]; }
+    if ((s[0] & 0xE0) == 0xC0) { cp = s[0] & 0x1F; n = 2; }
+    else if ((s[0] & 0xF0) == 0xE0) { cp = s[0] & 0x0F; n = 3; }
+    else if ((s[0] & 0xF8) == 0xF0) { cp = s[0] & 0x07; n = 4; }
+    else { *consumed = 1; return 0xFFFD; }
+    if (n > max) { *consumed = 1; return 0xFFFD; }
+    {
+        int i;
+        for (i = 1; i < n; i++) {
+            if ((s[i] & 0xC0) != 0x80) { *consumed = 1; return 0xFFFD; }
+            cp = (cp << 6) | (s[i] & 0x3F);
+        }
+    }
+    *consumed = n;
+    return cp;
+}
+
+/*
+ * Translate a Unicode codepoint to CP437.
+ * Returns the CP437 byte, or 0 if no mapping exists.
+ */
+static unsigned char unicode_to_cp437(unsigned int cp)
+{
+    int lo, hi, mid;
+    /* ASCII printable: direct */
+    if (cp >= 0x20 && cp <= 0x7E) return (unsigned char)cp;
+    /* Newline: preserve as sentinel (caller handles) */
+    if (cp == '\n' || cp == '\r') return (unsigned char)cp;
+    /* Tab: pass through */
+    if (cp == '\t') return '\t';
+    /* Binary search the extension table */
+    lo = 0; hi = UNI_MAP_LEN - 1;
+    while (lo <= hi) {
+        mid = (lo + hi) / 2;
+        if (uni_to_cp437[mid].unicode == cp) return uni_to_cp437[mid].cp437;
+        if (uni_to_cp437[mid].unicode  < cp) lo = mid + 1;
+        else                                  hi = mid - 1;
+    }
+    return 0; /* no mapping */
+}
+
+/*
+ * Encode one Unicode codepoint as UTF-8 into buf (must have >= 4 bytes).
+ * Returns bytes written.
+ */
+static int utf8_encode(unsigned int cp, char *buf)
+{
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >>  6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+/*
+ * CP437 byte -> Unicode codepoint (for copy/export to clipboard).
+ * Handles the 0x80-0xFF extended range via the same table.
+ */
+static unsigned int cp437_to_unicode_cp(unsigned char c)
+{
+    int i;
+    if (c >= 0x20 && c <= 0x7E) return (unsigned int)c;
+    if (c == '\n') return '\n';
+    for (i = 0; i < UNI_MAP_LEN; i++) {
+        if (uni_to_cp437[i].cp437 == c)
+            return uni_to_cp437[i].unicode;
+    }
+    /* Fallback: U+FFFD replacement for unmapped control/glyph bytes */
+    return 0xFFFD;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Clipboard copy: build UTF-8 from the marked region                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Copy the current mark region to the X11 clipboard as UTF-8.
+ * Returns 1 on success, 0 if nothing selected.
+ */
+static int command_copy_to_clipboard(void)
+{
+    int sr, sc, er, ec, r;
+    /* Rough upper bound: each CP437 byte -> at most 3 UTF-8 bytes,
+     * plus newlines between lines.                                  */
+    int cap, used, need;
+    char *out;
+
+    if (mark_state.mode != MARK_DEFINED) return 0;
+    mark_region_bounds(&sr, &sc, &er, &ec);
+
+    cap  = (ec - sc + (er - sr + 1) * (VGA_COLS + 1)) * 3 + 16;
+    out  = (char *)malloc((size_t)cap);
+    if (!out) return 0;
+    used = 0;
+
+    for (r = sr; r <= er; r++) {
+        int col_start = (r == sr) ? sc : 0;
+        int col_end   = (r == er) ? ec : lines[r].len - 1;
+        int c;
+
+        /* Trim trailing spaces on non-final lines for clean copy */
+        if (r < er) {
+            while (col_end >= col_start &&
+                   col_end < lines[r].len &&
+                   lines[r].buf[col_end] == ' ')
+                col_end--;
+        }
+
+        for (c = col_start; c <= col_end && c < lines[r].len; c++) {
+            unsigned char byte = (unsigned char)lines[r].buf[c];
+            unsigned int  ucp  = cp437_to_unicode_cp(byte);
+            char          tmp[4];
+            int           n    = utf8_encode(ucp, tmp);
+            need = used + n + 2;
+            if (need >= cap) {
+                char *nb;
+                cap  = need * 2 + 64;
+                nb   = (char *)realloc(out, (size_t)cap);
+                if (!nb) { free(out); return 0; }
+                out  = nb;
+            }
+            memcpy(out + used, tmp, (size_t)n);
+            used += n;
+        }
+        /* Insert newline between lines (not after the last) */
+        if (r < er) {
+            if (used + 2 >= cap) {
+                char *nb;
+                cap  = used * 2 + 64;
+                nb   = (char *)realloc(out, (size_t)cap);
+                if (!nb) { free(out); return 0; }
+                out  = nb;
+            }
+            out[used++] = '\n';
+        }
+    }
+    out[used] = '\0';
+
+    vio_clipboard_set(out, used);
+    free(out);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Clipboard paste: feed UTF-8 buffer as if typed                    */
+/* ------------------------------------------------------------------ */
+
+static void command_paste_from_clipboard(const char *utf8, int len)
+{
+    const unsigned char *p   = (const unsigned char *)utf8;
+    const unsigned char *end = p + len;
+
+    while (p < end) {
+        int          consumed = 0;
+        unsigned int cp       = utf8_decode(p, (int)(end - p), &consumed);
+        unsigned char c437;
+
+        if (consumed <= 0) { p++; continue; }
+        p += consumed;
+
+        if (cp == '\r') continue;   /* strip CR from CRLF pairs */
+
+        if (cp == '\n') {
+            /* Treat as Enter */
+            handle_key(KEY_ENTER);
+            continue;
+        }
+
+        c437 = unicode_to_cp437(cp);
+        if (c437 >= 32) {
+            handle_key((int)c437);
+        }
+        /* silently drop untranslatable codepoints */
+    }
+}
+
+
 static void die_oom(void)
 {
     fputs("macguffin: out of memory\n", stderr);
@@ -2911,6 +3155,49 @@ static void handle_key(int ch)
     case KEY_CTRL('g'):
         do_find(NULL);
         break;
+
+    /* Clipboard ------------------------------------------------------- */
+    case KEY_CTRL('c'):
+        /* Copy marked region to X11 clipboard (mark stays active)    */
+        if (mark_state.mode == MARK_DEFINED) {
+            if (command_copy_to_clipboard())
+                set_notify("copied to clipboard");
+            else
+                set_console_error("nothing to copy");
+        } else {
+            set_console_error("no selection  (Ctrl-K to mark)");
+        }
+        break;
+
+    case KEY_CTRL('x'):
+        /* Cut: copy to clipboard then kill the region                */
+        if (mark_state.mode == MARK_DEFINED) {
+            if (command_copy_to_clipboard()) {
+                command_kill_mark();
+                set_notify("cut to clipboard");
+            } else {
+                set_console_error("cut failed");
+            }
+        } else {
+            set_console_error("no selection  (Ctrl-K to mark)");
+        }
+        break;
+
+    case KEY_CTRL('v'):
+        /* Paste: request clipboard; data arrives as KEY_PASTE_READY  */
+        if (mark_state.mode == MARK_DEFINED) mark_clear();
+        if (mark_state.mode == MARK_CTRL_K)  mark_clear();
+        vio_clipboard_request();
+        break;
+
+    case KEY_PASTE_READY: {
+        /* SelectionNotify delivered — retrieve and feed chars         */
+        int plen = 0;
+        const char *pdata = vio_clipboard_take(&plen);
+        if (pdata && plen > 0)
+            command_paste_from_clipboard(pdata, plen);
+        break;
+    }
 
     case KEY_CTRL('b'):
         cur_fmt ^= FMT_BOLD;
