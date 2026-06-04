@@ -127,7 +127,10 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 | Ctrl-R           | Arm current header/footer as repeating template |
 | Ctrl-Z           | Undelete (restore last killed to its origin)    |
 | Ctrl-K           | Drop mark anchor / close mark region            |
-| Ctrl-Y           | Kill current line → undelete slot                |
+| Ctrl-Y           | Kill current line → undelete slot               |
+| Ctrl-C           | Copy marked region to X11 clipboard             |
+| Ctrl-X           | Cut marked region to X11 clipboard              |
+| Ctrl-V           | Paste from X11 clipboard                        |
 | Ctrl-Backspace   | Kill word backward → undelete slot              |
 | Ctrl-Delete      | Kill word forward → undelete slot               |
 | Esc              | Cancel mark / open console                      |
@@ -144,13 +147,25 @@ Characters 32–255 are passed straight through as CP437 glyphs.
 
 ## Mark and Kill
 
-Macguffin uses a **mark and kill** model rather than a conventional clipboard. This fits the fixed-geometry editing philosophy: operations are intentional and permanent, with a single-slot undelete buffer for immediate recovery.
+Macguffin uses a **mark and kill** model for region operations. This fits the fixed-geometry editing philosophy: operations are intentional and permanent, with a single-slot undelete buffer for immediate recovery.
 
 ### Defining a region
 
 Press **Ctrl+K** to drop an anchor at the cursor. The status bar shows `[^K] second mark  [ESC] cancel`. Navigate freely with plain arrows — the mark stays active. Press **Ctrl+K** again to close the region; the status bar changes to `[F1] kill  [ESC] cancel`. The marked region is shown inverted on screen. **ESC** cancels at any point without killing.
 
 Plain arrows clear a defined mark and move normally. Typing a character also clears the mark.
+
+### Clipboard (Ctrl-C, Ctrl-X, Ctrl-V)
+
+Macguffin integrates with the standard X11 `CLIPBOARD` selection, so text flows naturally between the editor and other applications.
+
+**Copy** (`Ctrl-C`) exports the marked region to the clipboard as UTF-8. CP437 extended characters (accented letters, box-drawing, symbols) are translated to their Unicode equivalents. The mark stays active after copying.
+
+**Cut** (`Ctrl-X`) copies the region to the clipboard and then kills it, exactly as if you had pressed `Ctrl-C` followed by `F1`.
+
+**Paste** (`Ctrl-V`) requests the current clipboard content from the system. The text arrives as UTF-8, is translated back to CP437, and is fed into the editor as if typed — so it obeys the current INS/OVR mode, tab stops, line wrapping, and all other editing rules. Rich text attributes (bold, italic, underline) are not carried through paste; pasted text arrives unstyled.
+
+Both copy and paste work with any X11 application that speaks `UTF8_STRING` — terminals, browsers, office applications, and so on.
 
 ### INS and OVR mode affect all delete operations
 
@@ -161,7 +176,7 @@ The Insert/Overwrite toggle (Insert key) controls how every delete action — ba
 **In OVR mode** delete operations blank: characters are replaced with spaces and nothing shifts. The physical space on the page is preserved. Lines are never shortened or joined by a delete in OVR mode. This matches typewriter correction behaviour — like correction fluid that erases without disturbing the surrounding layout.
 
 | Operation      | INS                                 | OVR                                |
-|----------------|-------------------------------------|------------------------------------|
+|----------------|-------------------------------------|-------------------------------------|
 | Backspace      | Collapse left; join lines at col 0  | Move left, blank cell; stop at col 0 |
 | Delete         | Collapse right; join lines at end   | Blank cell in place; stop at end   |
 | Ctrl+Backspace | Collapse word span                  | Blank word span with spaces        |
@@ -316,10 +331,10 @@ Use `save as name.mgf` for a project file and `save as name.txt` for plain text.
 
 ### MGF Format
 
-MGF is a simple line-oriented text format. The current version is **MGF5**.
+MGF is a simple line-oriented text format. The current version is **MGF6**.
 
 ```
-MGF5
+MGF6
 page 66
 stops 0 79 8 72 8
 header 0 <hex>
@@ -333,13 +348,13 @@ Each line record encodes text and format attributes as paired hex strings separa
 
 ## Macguffin is a pencil.
 
-Macguffin is a tool, like a pencil, as such it belongs in a toolbox, not in a box for sale.  It is for you to make other things.  You can support macguffin if its usefull, and you are so inclided to you by emailing me at z80dad (at) gmail (dot) com.
+Macguffin is a tool, like a pencil, as such it belongs in a toolbox, not in a box for sale. It is for you to make other things. You can support Macguffin if it's useful, and you are so inclined, by emailing me at z80dad (at) gmail (dot) com.
 
 ## License
 
 MIT License
 
-Copyright David Collins(c) 2026
+Copyright David Collins (c) 2026
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -358,4 +373,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-

@@ -44,6 +44,7 @@
 #define LINE_FLAG_REPEAT     0x01
 #define LINE_FLAG_PAGE_BREAK 0x02
 #define LINE_FLAG_FOOTER     0x04
+#define LINE_SOFT_WRAP       0x08  /* line is a soft-wrap continuation  */
 
 typedef struct {
     char          *buf; /* character data                        */
@@ -60,6 +61,8 @@ typedef struct {
     int center_tab;
     int tab_size;
 } TabStops;
+
+static TabStops tabs;   /* initialised by tab_init() at startup */
 
 typedef struct {
     int  active;
@@ -123,6 +126,7 @@ static unsigned char undel_fmt_buf[UNDEL_MAX];
 static int           undel_len        = 0;
 static int           undel_active     = 0;
 static int           undel_was_insert = 1;  /* 0 = OVR blank, 1 = INS collapse */
+static int           undel_soft_wrap  = 0;  /* LINE_SOFT_WRAP state of killed \n */
 static int           undel_row        = 0;  /* origin row of last kill          */
 static int           undel_col        = 0;  /* origin col of last kill          */
 
@@ -133,6 +137,8 @@ static unsigned char line_flags[MAX_LINES];
 static void mark_visible_dirty(void);
 static void mark_region_bounds(int *sr, int *sc, int *er, int *ec);
 static void handle_key(int ch);
+static void reflow_paragraph(void);
+static void wrap_current_line(void);
 
 /* ------------------------------------------------------------------ */
 /*  Unicode -> CP437 translation for paste                             */
@@ -298,11 +304,22 @@ static int command_copy_to_clipboard(void)
     used = 0;
 
     for (r = sr; r <= er; r++) {
-        int col_start = (r == sr) ? sc : 0;
-        int col_end   = (r == er) ? ec : lines[r].len - 1;
+        int is_soft_continuation = (r > sr) &&
+                                   (line_flags[r] & LINE_SOFT_WRAP);
+        int col_start, col_end;
         int c;
 
-        /* Trim trailing spaces on non-final lines for clean copy */
+        /* On soft-wrap continuations, skip the left_tab indent prefix
+         * ONLY when the selection starts before or at left_tab on this
+         * line — i.e. the prefix is pure layout, not user content.   */
+        if (is_soft_continuation && sc <= tabs.left_tab)
+            col_start = tabs.left_tab;
+        else
+            col_start = (r == sr) ? sc : 0;
+
+        col_end = (r == er) ? ec : lines[r].len - 1;
+
+        /* Trim trailing spaces before emitting line content           */
         if (r < er) {
             while (col_end >= col_start &&
                    col_end < lines[r].len &&
@@ -326,16 +343,26 @@ static int command_copy_to_clipboard(void)
             memcpy(out + used, tmp, (size_t)n);
             used += n;
         }
-        /* Insert newline between lines (not after the last) */
+
+        /* Inter-line separator:
+         *   soft wrap  -> space (words flow together at destination)
+         *   hard break -> newline                                      */
         if (r < er) {
-            if (used + 2 >= cap) {
+            int next_is_soft = line_flags[r + 1] & LINE_SOFT_WRAP;
+            if (used + 4 >= cap) {
                 char *nb;
                 cap  = used * 2 + 64;
                 nb   = (char *)realloc(out, (size_t)cap);
                 if (!nb) { free(out); return 0; }
                 out  = nb;
             }
-            out[used++] = '\n';
+            if (next_is_soft) {
+                /* Only emit a space if we didn't already end with one */
+                if (used == 0 || out[used - 1] != ' ')
+                    out[used++] = ' ';
+            } else {
+                out[used++] = '\n';
+            }
         }
     }
     out[used] = '\0';
@@ -362,11 +389,29 @@ static void command_paste_from_clipboard(const char *utf8, int len)
         if (consumed <= 0) { p++; continue; }
         p += consumed;
 
-        if (cp == '\r') continue;   /* strip CR from CRLF pairs */
+        /* Strip bare CR (handle CRLF by treating \r as nothing;
+         * the following \n will be processed normally)               */
+        if (cp == '\r') continue;
 
         if (cp == '\n') {
-            /* Treat as Enter */
-            handle_key(KEY_ENTER);
+            /* Look ahead: is the next non-CR character also \n?
+             * \n\n => blank line => hard paragraph break (Enter x2)
+             * lone \n => soft wrap separator => space, let reflow fit */
+            const unsigned char *q = p;
+            /* skip any \r */
+            while (q < end && *q == '\r') q++;
+
+            if (q < end && *q == '\n') {
+                /* Double newline — hard paragraph break              */
+                handle_key(KEY_ENTER);
+                /* Consume the second \n (and any \r before it)       */
+                p = q + 1;
+            } else {
+                /* Single newline — soft separator.
+                 * Only emit a space if the line isn't already going
+                 * to wrap naturally (insert_printable handles that). */
+                handle_key(' ');
+            }
             continue;
         }
 
@@ -463,7 +508,7 @@ static void line_truncate(Line *l, int len)
     }
 }
 
-static void split_line(int row, int pos)
+static void split_line(int row, int pos, int soft)
 {
     int i, tail;
     if (nlines >= MAX_LINES) return;
@@ -476,7 +521,7 @@ static void split_line(int row, int pos)
         line_flags[i] = line_flags[i - 1];
     }
     nlines++;
-    line_flags[row + 1] = 0;
+    line_flags[row + 1] = soft ? LINE_SOFT_WRAP : 0;
 
     line_init(&lines[row + 1]);
     tail = lines[row].len - pos;
@@ -561,7 +606,6 @@ static int status_dirty  = 1;
 static int content_dirty = 1;
 static int ruler_dirty   = 1;
 
-static TabStops tabs;
 static Console console_state;
 
 static VGATerm *g_vt     = NULL; /* set after vgaterm_open; used by command_scale */
@@ -812,6 +856,7 @@ static void command_kill_mark(void)
     }
     undel_active     = (undel_len > 0);
     undel_was_insert = ins_mode;
+    undel_soft_wrap  = (sr < er) ? (line_flags[sr + 1] & LINE_SOFT_WRAP) : 0;
     undel_row        = sr;           /* cursor lands here after kill */
     undel_col        = sc;
 
@@ -908,7 +953,7 @@ static void command_undelete(void)
 
             if (ch == '\n') {
                 if (nlines < MAX_LINES) {
-                    split_line(cur_row, cur_col);
+                    split_line(cur_row, cur_col, undel_soft_wrap);
                     line_dirty[cur_row]     = 1;
                     line_dirty[cur_row + 1] = 1;
                     cur_row++;
@@ -1083,7 +1128,7 @@ static void draw_status(void)
         vio_clrline(VGA_ROWS - 1, VGA_ATTR(VGA_CYAN, VGA_BLACK));
         vio_gotoxy(0, VGA_ROWS - 1);
         if (mark_state.mode == MARK_CTRL_K)
-            vio_puts("[^K] second mark   [ESC] cancel");
+            vio_puts("[^K] close   [Shift+\x18\x19\x1a\x1b] extend   [ESC] cancel");
         else
             vio_puts("[F1] kill   [ESC] cancel");
         vio_gotoxy(55, VGA_ROWS - 1);
@@ -1575,7 +1620,7 @@ static int save_project(const char *path)
     f = fopen(path, "wb");
     if (!f) return -1;
 
-    fprintf(f, "MGF5\n");
+    fprintf(f, "MGF6\n");
     fprintf(f, "page %d\n", page_len);
     fprintf(f, "stops %d %d %d %d %d\n",
             tabs.left_page, tabs.right_page,
@@ -1800,6 +1845,8 @@ static int do_load(const char *path)
             project_version = 4;
         } else if (strcmp(buf, "MGF5\n") == 0 || strcmp(buf, "MGF5\r\n") == 0) {
             project_version = 5;
+        } else if (strcmp(buf, "MGF6\n") == 0 || strcmp(buf, "MGF6\r\n") == 0) {
+            project_version = 6;
         } else {
             fclose(f);
             return -1;
@@ -2047,7 +2094,7 @@ static void insert_page_break(void)
     if (nlines > MAX_LINES - 2)
         return;
 
-    split_line(cur_row, cur_col);
+    split_line(cur_row, cur_col, 0);
     row = cur_row + 1;
     make_page_break_text(marker, &marker_len);
     insert_line_copy(row, marker, marker_len, LINE_FLAG_PAGE_BREAK);
@@ -2075,6 +2122,227 @@ static void insert_page_break(void)
     ensure_visible();
 }
 
+/*
+ * reflow_paragraph(start_row)
+ *
+ * Paragraph = a run of lines where every line EXCEPT the first has
+ * LINE_SOFT_WRAP set, and no line has any hard special flag
+ * (PAGE_BREAK / REPEAT / FOOTER).
+ *
+ * Steps:
+ *  1. Walk backward from start_row to find the first line of the paragraph.
+ *  2. Walk forward from there, joining all soft-wrap continuation lines into
+ *     one long logical line (stripping the left_tab indent prefix from each
+ *     continuation as we go).
+ *  3. Re-split the joined line word-by-word using the same logic as
+ *     wrap_current_line, cascading until everything fits.
+ *  4. Adjust cur_row / cur_col to track where the cursor ended up.
+ *
+ * cur_row / cur_col must be valid before the call.
+ * After the call they point to the correct position in the reflowed paragraph.
+ */
+
+/* Hard-stop flags — reflow never crosses these */
+#define LINE_HARD_FLAGS \
+    (LINE_FLAG_PAGE_BREAK | LINE_FLAG_REPEAT | LINE_FLAG_FOOTER)
+
+static void reflow_paragraph(void)
+{
+    int para_start, para_end;
+    int r, i;
+    int   log_cap;
+    char *log_buf  = NULL;
+    unsigned char *log_fmt = NULL;
+    int   log_len  = 0;
+    int   cur_off  = 0;
+    int   cur_resolved = 0;   /* 1 once new_row/new_col are finalised  */
+    int   new_row, new_col;
+    int   line_start;
+
+    /* ----------------------------------------------------------------
+     * Step 1: find paragraph boundaries.
+     *
+     * Walk backward through LINE_SOFT_WRAP lines to find the head.
+     * Walk forward  through LINE_SOFT_WRAP lines to find the tail.
+     * Any line with LINE_HARD_FLAGS is an absolute barrier.
+     * ---------------------------------------------------------------- */
+    para_start = cur_row;
+    while (para_start > 0 &&
+           (line_flags[para_start] & LINE_SOFT_WRAP) &&
+           !(line_flags[para_start] & LINE_HARD_FLAGS))
+        para_start--;
+
+    /* If we landed on a hard-flag line, step one forward              */
+    if (line_flags[para_start] & LINE_HARD_FLAGS)
+        para_start++;
+
+    para_end = para_start;
+    while (para_end + 1 < nlines &&
+           (line_flags[para_end + 1] & LINE_SOFT_WRAP) &&
+           !(line_flags[para_end + 1] & LINE_HARD_FLAGS))
+        para_end++;
+
+    /* Nothing to reflow: single hard line that fits, or no neighbours  */
+    if (para_start == para_end) {
+        /* Only reflow if this line is a soft-wrap continuation itself,
+         * or the next line is — i.e. there's actual paragraph context. *
+         * A standalone hard line that just happens to be long is left   *
+         * to wrap_current_line to handle one split at a time.           */
+        int this_is_soft = line_flags[para_start] & LINE_SOFT_WRAP;
+        int next_is_soft = (para_start + 1 < nlines) &&
+                           (line_flags[para_start + 1] & LINE_SOFT_WRAP);
+        if (!this_is_soft && !next_is_soft)
+            return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Step 2: join all paragraph lines into one logical buffer.
+     * ---------------------------------------------------------------- */
+    log_cap = (para_end - para_start + 1) * (VGA_COLS + 2) + 4;
+    log_buf = (char *)malloc((size_t)log_cap);
+    log_fmt = (unsigned char *)malloc((size_t)log_cap);
+    if (!log_buf || !log_fmt) { free(log_buf); free(log_fmt); return; }
+
+    for (r = para_start; r <= para_end; r++) {
+        int col_start = (r == para_start) ? 0 : tabs.left_tab;
+        int col_end   = lines[r].len;
+        int run;
+
+        if (r == cur_row) {
+            cur_off = log_len + (cur_col - col_start);
+            if (cur_off < 0)    cur_off = 0;
+            if (cur_off > log_len + (col_end - col_start))
+                cur_off = log_len + (col_end - col_start);
+        }
+
+        run = col_end - col_start;
+        if (run < 0) run = 0;
+        if (log_len + run + 2 >= log_cap) {
+            run = log_cap - log_len - 2;
+            if (run <= 0) break;
+        }
+
+        memcpy(log_buf + log_len, lines[r].buf + col_start, (size_t)run);
+        memcpy(log_fmt + log_len, lines[r].fmt + col_start, (size_t)run);
+        log_len += run;
+
+        if (r < para_end && log_len > 0 && log_buf[log_len - 1] != ' ') {
+            log_buf[log_len]   = ' ';
+            log_fmt[log_len]   = 0;
+            log_len++;
+        }
+    }
+    log_buf[log_len] = '\0';
+
+    if (cur_off > log_len) cur_off = log_len;
+
+    /* Trim trailing spaces                                             */
+    while (log_len > 0 && log_buf[log_len - 1] == ' ') {
+        log_len--;
+        if (cur_off > log_len) cur_off = log_len;
+    }
+    log_buf[log_len] = '\0';
+
+    /* ----------------------------------------------------------------
+     * Step 3: write logical content back to para_start, delete the
+     *         old continuation lines.
+     * ---------------------------------------------------------------- */
+    line_grow(&lines[para_start], log_len + 1);
+    memcpy(lines[para_start].buf, log_buf, (size_t)(log_len + 1));
+    memcpy(lines[para_start].fmt, log_fmt, (size_t)log_len);
+    lines[para_start].len = log_len;
+    line_flags[para_start] &= (unsigned char)~LINE_SOFT_WRAP;
+    line_dirty[para_start]  = 1;
+
+    /* Delete continuation lines [para_start+1 .. para_end]            */
+    for (r = para_start + 1; r <= para_end; r++) {
+        line_free(&lines[para_start + 1]);
+        for (i = para_start + 1; i < nlines - 1; i++) {
+            lines[i]      = lines[i + 1];
+            line_flags[i] = line_flags[i + 1];
+        }
+        nlines--;
+    }
+
+    /* ----------------------------------------------------------------
+     * Step 4: re-split lines[para_start] at tab-stop width.
+     * ---------------------------------------------------------------- */
+    new_row    = para_start;
+    new_col    = tabs.left_tab;
+    line_start = 0;
+    r          = para_start;
+
+    while (lines[r].len > tabs.right_tab + 1) {
+        int wrap_col = tabs.right_tab;
+        int split_at = -1;
+        int split_pos;
+        int content_end;
+        int j;
+
+        if (nlines >= MAX_LINES) break;
+
+        for (j = wrap_col; j > tabs.left_tab; j--) {
+            if (j < lines[r].len && lines[r].buf[j] == ' ') {
+                split_at = j;
+                break;
+            }
+        }
+
+        if (split_at > tabs.left_tab) {
+            split_pos = split_at + 1;
+            split_line(r, split_pos, 1);
+            line_del(&lines[r], split_at);
+            content_end = line_start + split_at;
+        } else {
+            split_pos = wrap_col + 1;
+            if (split_pos > lines[r].len)
+                split_pos = lines[r].len;
+            split_line(r, split_pos, 1);
+            content_end = line_start + split_pos;
+        }
+
+        prefix_line_spaces(&lines[r + 1], tabs.left_tab);
+        line_dirty[r]     = 1;
+        line_dirty[r + 1] = 1;
+
+        /* Track cursor                                                */
+        if (!cur_resolved) {
+            if (cur_off < content_end) {
+                new_row     = r;
+                new_col     = cur_off - line_start;
+                cur_resolved = 1;
+            } else {
+                line_start = content_end + 1; /* +1 for the removed space */
+            }
+        }
+
+        r++;
+    }
+
+    if (!cur_resolved) {
+        new_row = r;
+        new_col = tabs.left_tab + (cur_off - line_start);
+    }
+
+    if (new_col > lines[new_row].len)
+        new_col = lines[new_row].len;
+    if (new_col < tabs.left_tab && lines[new_row].len > 0)
+        new_col = tabs.left_tab;
+
+    cur_row = new_row;
+    cur_col = new_col;
+
+    line_dirty[r] = 1;
+    mark_visible_dirty();
+    content_dirty = 1;
+    status_dirty  = 1;
+    modified      = 1;
+    ensure_visible();
+
+    free(log_buf);
+    free(log_fmt);
+}
+
 static void wrap_current_line(void)
 {
     int wrap_col = tabs.right_tab;
@@ -2097,14 +2365,14 @@ static void wrap_current_line(void)
 
     if (split_at > tabs.left_tab) {
         split_pos = split_at + 1;
-        split_line(cur_row, split_pos);
+        split_line(cur_row, split_pos, 1);
         line_del(&lines[cur_row], split_at);
         cur_col = tabs.left_tab + old_col - split_pos;
     } else {
         split_pos = wrap_col + 1;
         if (split_pos > lines[cur_row].len)
             split_pos = lines[cur_row].len;
-        split_line(cur_row, split_pos);
+        split_line(cur_row, split_pos, 1);
         cur_col = tabs.left_tab + old_col - split_pos;
     }
 
@@ -2232,7 +2500,7 @@ static void justify_current_word(void)
     status_dirty = 1;
 
     if (make_break && nlines < MAX_LINES) {
-        split_line(cur_row, l->len);
+        split_line(cur_row, l->len, 1);
         cur_row++;
         reserve_page_footer_if_needed();
     reserve_page_header_if_needed();
@@ -3159,19 +3427,21 @@ static void handle_key(int ch)
     /* Clipboard ------------------------------------------------------- */
     case KEY_CTRL('c'):
         /* Copy marked region to X11 clipboard (mark stays active)    */
-        if (mark_state.mode == MARK_DEFINED) {
+        if (mark_state.mode == MARK_DEFINED ||
+            mark_state.mode == MARK_CTRL_K) {
             if (command_copy_to_clipboard())
                 set_notify("copied to clipboard");
             else
                 set_console_error("nothing to copy");
         } else {
-            set_console_error("no selection  (Ctrl-K to mark)");
+            set_console_error("no selection  (Ctrl-K or Shift+arrow)");
         }
         break;
 
     case KEY_CTRL('x'):
         /* Cut: copy to clipboard then kill the region                */
-        if (mark_state.mode == MARK_DEFINED) {
+        if (mark_state.mode == MARK_DEFINED ||
+            mark_state.mode == MARK_CTRL_K) {
             if (command_copy_to_clipboard()) {
                 command_kill_mark();
                 set_notify("cut to clipboard");
@@ -3179,7 +3449,7 @@ static void handle_key(int ch)
                 set_console_error("cut failed");
             }
         } else {
-            set_console_error("no selection  (Ctrl-K to mark)");
+            set_console_error("no selection  (Ctrl-K or Shift+arrow)");
         }
         break;
 
@@ -3289,6 +3559,89 @@ static void handle_key(int ch)
         status_dirty = 1;
         break;
 
+    /* Shift+arrow selection ----------------------------------------- */
+    case KEY_SHIFT_UP:
+        if (mark_state.mode == MARK_NONE || mark_state.mode == MARK_DEFINED) {
+            mark_state.anchor_row = cur_row;
+            mark_state.anchor_col = cur_col;
+            mark_state.mode       = MARK_CTRL_K;
+            mark_visible_dirty();
+        }
+        if (cur_row > 0) {
+            cur_row--;
+            if (lines[cur_row].len == 0 && line_flags[cur_row] == 0) {
+                int r = cur_row;
+                while (r > 0 && lines[r].len == 0 && line_flags[r] == 0)
+                    r--;
+                if (line_flags[r] & LINE_FLAG_PAGE_BREAK)
+                    cur_row = r;
+            }
+            clamp_col();
+            ensure_visible();
+        }
+        mark_visible_dirty();
+        status_dirty = 1;
+        break;
+
+    case KEY_SHIFT_DOWN:
+        if (mark_state.mode == MARK_NONE || mark_state.mode == MARK_DEFINED) {
+            mark_state.anchor_row = cur_row;
+            mark_state.anchor_col = cur_col;
+            mark_state.mode       = MARK_CTRL_K;
+            mark_visible_dirty();
+        }
+        if (cur_row < nlines - 1) {
+            int was_break = line_flags[cur_row] & LINE_FLAG_PAGE_BREAK;
+            cur_row++;
+            if (was_break) {
+                while (cur_row < nlines - 1 &&
+                       lines[cur_row].len == 0 &&
+                       line_flags[cur_row] == 0)
+                    cur_row++;
+            }
+            clamp_col();
+            ensure_visible();
+        }
+        mark_visible_dirty();
+        status_dirty = 1;
+        break;
+
+    case KEY_SHIFT_LEFT:
+        if (mark_state.mode == MARK_NONE || mark_state.mode == MARK_DEFINED) {
+            mark_state.anchor_row = cur_row;
+            mark_state.anchor_col = cur_col;
+            mark_state.mode       = MARK_CTRL_K;
+            mark_visible_dirty();
+        }
+        if (cur_col > 0) {
+            cur_col--;
+        } else if (cur_row > 0) {
+            cur_row--;
+            cur_col = lines[cur_row].len;
+            ensure_visible();
+        }
+        mark_visible_dirty();
+        status_dirty = 1;
+        break;
+
+    case KEY_SHIFT_RIGHT:
+        if (mark_state.mode == MARK_NONE || mark_state.mode == MARK_DEFINED) {
+            mark_state.anchor_row = cur_row;
+            mark_state.anchor_col = cur_col;
+            mark_state.mode       = MARK_CTRL_K;
+            mark_visible_dirty();
+        }
+        if (cur_col < lines[cur_row].len) {
+            cur_col++;
+        } else if (cur_row < nlines - 1) {
+            cur_row++;
+            cur_col = tabs.left_tab;
+            ensure_visible();
+        }
+        mark_visible_dirty();
+        status_dirty = 1;
+        break;
+
     case KEY_PGUP:
         if (mark_state.mode == MARK_DEFINED) mark_clear();
         cur_row -= EDIT_ROWS - 1;
@@ -3311,6 +3664,17 @@ static void handle_key(int ch)
     case KEY_INS:
         ins_mode = !ins_mode;
         status_dirty = 1;
+        break;
+
+    case KEY_SHIFT_RELEASE:
+        /* Releasing Shift closes an active shift-selection the same
+         * way a second Ctrl+K would — region is now defined and ready
+         * for kill, copy, or cut.                                     */
+        if (mark_state.mode == MARK_CTRL_K) {
+            mark_state.mode = MARK_DEFINED;
+            mark_visible_dirty();
+            status_dirty = 1;
+        }
         break;
 
     /* Mark ---------------------------------------------------------- */
@@ -3355,7 +3719,9 @@ static void handle_key(int ch)
             set_notify("maximum lines reached");
             break;
         }
-        split_line(cur_row, cur_col);
+        split_line(cur_row, cur_col, 0);
+        /* Enter on a soft-wrap line promotes it to a hard break      */
+        line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
         line_dirty[cur_row] = 1;
         line_dirty[cur_row + 1] = 1;
         cur_row++;
@@ -3404,6 +3770,7 @@ static void handle_key(int ch)
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
+                reflow_paragraph();
             } else if (cur_col > 0) {
                 /* Between col 0 and left_tab: strip leading indent  *
                  * spaces then fall through to join with prev line.  */
@@ -3415,6 +3782,9 @@ static void handle_key(int ch)
                 }
                 if (cur_row > 0) {
                     int prev_len = lines[cur_row - 1].len;
+                    /* Clear soft-wrap on current line before join so the
+                     * joined result is treated as part of the paragraph */
+                    line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
                     join_lines(cur_row - 1);
                     line_dirty[cur_row - 1] = 1;
                     mark_visible_dirty();
@@ -3424,9 +3794,11 @@ static void handle_key(int ch)
                     content_dirty = 1;
                     status_dirty  = 1;
                     ensure_visible();
+                    reflow_paragraph();
                 }
             } else if (cur_row > 0) {
                 int prev_len = lines[cur_row - 1].len;
+                line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
                 join_lines(cur_row - 1);
                 line_dirty[cur_row - 1] = 1;
                 mark_visible_dirty();
@@ -3436,6 +3808,7 @@ static void handle_key(int ch)
                 content_dirty = 1;
                 status_dirty  = 1;
                 ensure_visible();
+                reflow_paragraph();
             }
         }
         break;
@@ -3463,13 +3836,19 @@ static void handle_key(int ch)
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
+                reflow_paragraph();
             } else if (cur_row < nlines - 1) {
+                /* Delete at end of line — join next line; if the next
+                 * line is a soft-wrap, clear the flag so join treats
+                 * it as content to be reflowed, not a barrier.       */
+                line_flags[cur_row + 1] &= (unsigned char)~LINE_SOFT_WRAP;
                 join_lines(cur_row);
                 line_dirty[cur_row] = 1;
                 mark_visible_dirty();
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
+                reflow_paragraph();
             }
         }
         break;
