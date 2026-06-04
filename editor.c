@@ -2173,6 +2173,56 @@ static void insert_page_break(void)
     ensure_visible();
 }
 
+/* Find the previous LINE_FLAG_PAGE_BREAK at or before `from_row`.
+ * Returns the index of the marker line, or -1 if none found.        */
+static int find_previous_page_break(int from_row)
+{
+    int r = from_row;
+    while (r >= 0) {
+        if (line_flags[r] & LINE_FLAG_PAGE_BREAK)
+            return r;
+        r--;
+    }
+    return -1;
+}
+
+/* Clear a page break marker and its following padding lines inserted
+ * by `insert_page_break()` for just that page. Leaves any non-empty
+ * content intact.                                             */
+static void clear_page_break_at(int marker_row)
+{
+    int r;
+    if (marker_row < 0 || marker_row >= nlines) return;
+    if (!(line_flags[marker_row] & LINE_FLAG_PAGE_BREAK)) return;
+    /* remove the marker line and any following empty padding lines */
+    {
+        int before = nlines;
+        delete_line(marker_row);
+        r = marker_row; /* now points to the line that used to follow marker */
+        while (r < nlines && lines[r].len == 0 && line_flags[r] == 0) {
+            delete_line(r);
+        }
+        /* adjust cursor: if it was after the removed block, move it up by
+         * the number of removed lines so it stays on the same logical
+         * content. */
+        {
+            int removed = before - nlines;
+            if (removed > 0 && cur_row >= marker_row) {
+                cur_row -= removed;
+                if (cur_row < 0) cur_row = 0;
+                if (cur_row >= nlines) cur_row = nlines - 1;
+                clamp_col();
+            }
+        }
+    }
+
+    mark_visible_dirty();
+    content_dirty = 1;
+    modified = 1;
+    status_dirty = 1;
+    ensure_visible();
+}
+
 /*
  * reflow_paragraph(start_row)
  *
@@ -3361,6 +3411,13 @@ static void console_execute(void)
         insert_page_break();
         console_state.saved_row = cur_row;
         console_state.saved_col = cur_col;
+    } else if (strcmp(arg, "break clear") == 0) {
+        /* Clear page break on current page only */
+        int marker = find_previous_page_break(cur_row);
+        if (marker >= 0)
+            clear_page_break_at(marker);
+        else
+            set_console_error("no page break on this page");
     } else if (strcmp(arg, "save") == 0) {
         if (do_save() < 0 && !console_state.has_error)
             set_console_error("save failed");
@@ -3893,10 +3950,76 @@ static void handle_key(int ch)
                     line_del(&lines[cur_row], 0);
                     cur_col--;
                 }
+
+                /* If we are now at the left tab (or at col 0) and the
+                 * preceding content is a page break padding region,
+                 * jump to just before the page break instead of
+                 * joining/deleting anything between.                */
                 if (cur_row > 0) {
+                    int marker = find_previous_page_break(cur_row - 1);
+                    if (marker >= 0) {
+                        int r;
+                        int only_padding = 1;
+                        for (r = marker + 1; r < cur_row; r++) {
+                            if (!(lines[r].len == 0 && line_flags[r] == 0)) {
+                                only_padding = 0; break;
+                            }
+                        }
+                        if (only_padding) {
+                            /* Move cursor to just before the marker */
+                            cur_row = marker - 1;
+                            if (cur_row < 0) cur_row = 0;
+                            cur_col = lines[cur_row].len;
+                            ensure_visible();
+                            mark_visible_dirty();
+                            content_dirty = 1;
+                            status_dirty = 1;
+                            break;
+                        }
+                    }
+                    /* Not a page-break barrier: perform normal join */
+                    {
+                        int prev_len = lines[cur_row - 1].len;
+                        line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
+                        join_lines(cur_row - 1);
+                        line_dirty[cur_row - 1] = 1;
+                        mark_visible_dirty();
+                        modified = 1;
+                        cur_row--;
+                        cur_col       = prev_len;
+                        content_dirty = 1;
+                        status_dirty  = 1;
+                        ensure_visible();
+                        reflow_paragraph();
+                    }
+                }
+            } else if (cur_row > 0) {
+                /* If the previous content is separated by a page break
+                 * marker and padding, jump to just before the marker
+                 * instead of joining. */
+                int marker = find_previous_page_break(cur_row - 1);
+                if (marker >= 0) {
+                    int r;
+                    int only_padding = 1;
+                    for (r = marker + 1; r < cur_row; r++) {
+                        if (!(lines[r].len == 0 && line_flags[r] == 0)) {
+                            only_padding = 0; break;
+                        }
+                    }
+                    if (only_padding) {
+                        cur_row = marker - 1;
+                        if (cur_row < 0) cur_row = 0;
+                        cur_col = lines[cur_row].len;
+                        ensure_visible();
+                            mark_visible_dirty();
+                            content_dirty = 1;
+                            status_dirty = 1;
+                        break;
+                    }
+                }
+
+                {
                     int prev_len = lines[cur_row - 1].len;
-                    /* Clear soft-wrap on current line before join so the
-                     * joined result is treated as part of the paragraph */
                     line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
                     join_lines(cur_row - 1);
                     line_dirty[cur_row - 1] = 1;
@@ -3909,19 +4032,6 @@ static void handle_key(int ch)
                     ensure_visible();
                     reflow_paragraph();
                 }
-            } else if (cur_row > 0) {
-                int prev_len = lines[cur_row - 1].len;
-                line_flags[cur_row] &= (unsigned char)~LINE_SOFT_WRAP;
-                join_lines(cur_row - 1);
-                line_dirty[cur_row - 1] = 1;
-                mark_visible_dirty();
-                modified = 1;
-                cur_row--;
-                cur_col       = prev_len;
-                content_dirty = 1;
-                status_dirty  = 1;
-                ensure_visible();
-                reflow_paragraph();
             }
         }
         break;
@@ -4003,7 +4113,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    vt = vgaterm_open("editor");
+    vt = vgaterm_open("Macguffin");
     if (!vt) return 1;
     if (new_scale != 1)
         vgaterm_setup_scaling(vt, new_scale);

@@ -9,11 +9,16 @@ LDFLAGS = -lX11 -lm
 SRCS = editor.c $(VGADIR)/vgaterm.c $(VGADIR)/vio.c
 OBJS = editor.o vgaterm.o vio.o
 
-.PHONY: all run clean
 
-all: editor
+.PHONY: all run clean install uninstall
 
-editor: $(OBJS)
+# Installation prefix (can be overridden): e.g. `make install PREFIX=/usr`
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+
+all: mgf
+
+mgf: $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 editor.o: editor.c $(VGADIR)/vgaterm.h $(VGADIR)/vio.h
@@ -30,8 +35,16 @@ vio.o: $(VGADIR)/vio.c $(VGADIR)/vio.h $(VGADIR)/vgaterm.h
 $(VGADIR)/font_vga.h:
 	$(MAKE) -C $(VGADIR) font_vga.h
 
-run: editor
-	./editor
+run: mgf
+	./mgf
+
+
+install: mgf
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 mgf $(DESTDIR)$(BINDIR)/mgf
+
+uninstall:
+	-rm -f $(DESTDIR)$(BINDIR)/mgf
 
 clean:
-	rm -f editor *.o
+	rm -f mgf *.o
