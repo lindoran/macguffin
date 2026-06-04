@@ -695,6 +695,59 @@ static void mark_visible_dirty(void)
     content_dirty = 1;
 }
 
+/* Map (row,col) to a linear document offset (counts a newline after
+ * each line except the last). Used to enforce single-step cursor
+ * movement semantics across line boundaries.                         */
+static int doc_offset_from_pos(int row, int col)
+{
+    int i;
+    int off = 0;
+    if (row < 0) row = 0;
+    if (row >= nlines) row = nlines - 1;
+    if (col < 0) col = 0;
+    for (i = 0; i < row; i++)
+        off += lines[i].len + 1; /* +1 for newline */
+    if (col > lines[row].len) col = lines[row].len;
+    off += col;
+    return off;
+}
+
+/* Set cursor position from a linear document offset. Clamps to valid
+ * range.                                                              */
+static void set_pos_from_doc_offset(int off)
+{
+    int i;
+    if (off < 0) off = 0;
+    /* Compute total doc length */
+    {
+        int total = 0;
+        for (i = 0; i < nlines; i++) total += lines[i].len + 1;
+        if (total > 0) total -= 1; /* no trailing newline after last line */
+        if (off > total) off = total;
+    }
+
+    i = 0;
+    while (i < nlines) {
+        int line_len = lines[i].len;
+        if (off <= line_len) {
+            cur_row = i;
+            cur_col = off;
+            if (cur_col > lines[cur_row].len) cur_col = lines[cur_row].len;
+            return;
+        }
+        off -= (line_len + 1);
+        i++;
+    }
+    /* Fallback to end */
+    cur_row = nlines - 1;
+    cur_col = lines[cur_row].len;
+}
+
+static int is_logical_paragraph_end(int row)
+{
+    return row + 1 >= nlines || !(line_flags[row + 1] & LINE_SOFT_WRAP);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Cursor clamp + visibility                                          */
 /* ------------------------------------------------------------------ */
@@ -757,7 +810,19 @@ static int mark_cell_selected(int lr, int c)
         mark_state.mode != MARK_CTRL_K) return 0;
     mark_region_bounds(&sr, &sc, &er, &ec);
     if (lr < sr || lr > er) return 0;
-    if (lr == sr && c < sc) return 0;
+    /* Compute effective selection start for this line. On soft-wrap
+     * continuation lines the left_tab prefix is layout-only when the
+     * selection began on an earlier line (sc <= left_tab), so treat
+     * the selectable region on that line as starting at tabs.left_tab.
+     */
+    {
+        int line_sc = (lr == sr) ? sc : 0;
+        if (lr > sr && (line_flags[lr] & LINE_SOFT_WRAP) && sc <= tabs.left_tab)
+            line_sc = tabs.left_tab;
+        if (c < line_sc) return 0;
+    }
+
+    /* Effective end for this line */
     if (lr == er && c > ec) return 0;   /* ec is now inclusive        */
     return 1;
 }
@@ -846,6 +911,8 @@ static void command_format_region(int fmt_bit)
         if (changed) line_dirty[r] = 1;
     }
 
+    /* Force a visible redraw so formatting appears immediately. */
+    mark_visible_dirty();
     content_dirty = 1;
     modified      = 1;
 }
@@ -3917,6 +3984,9 @@ static void handle_key(int ch)
     case KEY_BS:
         if (mark_state.mode == MARK_DEFINED) { command_kill_mark(); break; }
         if (mark_state.mode == MARK_CTRL_K)  mark_clear();
+        /* Remember document offset so we can ensure backspace moves
+         * cursor exactly one logical cell left regardless of joins/rewrap. */
+        int old_off = doc_offset_from_pos(cur_row, cur_col);
         if (!ins_mode) {
             /* OVR: move left, blank that cell, stay there           */
             if (cur_col > 0) {
@@ -3929,24 +3999,42 @@ static void handle_key(int ch)
                     content_dirty = 1;
                     status_dirty  = 1;
                 }
+            } else {
+                /* at col 0 in OVR: if this line is a soft-wrap
+                 * continuation, move to the end of the previous
+                 * line (do not join). */
+                if (cur_row > 0 && (line_flags[cur_row] & LINE_SOFT_WRAP)) {
+                    cur_row--;
+                    cur_col = lines[cur_row].len;
+                    ensure_visible();
+                    mark_visible_dirty();
+                    content_dirty = 1;
+                    status_dirty = 1;
+                }
             }
-            /* at col 0 in OVR: stop, do not join lines             */
         } else {
             /* INS: collapse                                         */
             if (cur_col > tabs.left_tab) {
+                int old_len = lines[cur_row].len;
+                int del_col = cur_col - 1;
+                int skip_reflow =
+                    del_col == old_len - 1 &&
+                    lines[cur_row].buf[del_col] == ' ' &&
+                    is_logical_paragraph_end(cur_row);
                 cur_col--;
                 line_del(&lines[cur_row], cur_col);
                 line_dirty[cur_row] = 1;
                 modified      = 1;
                 content_dirty = 1;
                 status_dirty  = 1;
-                reflow_paragraph();
+                if (!skip_reflow)
+                    reflow_paragraph();
             } else if (cur_col > 0) {
-                /* Between col 0 and left_tab: strip leading indent  *
-                 * spaces then fall through to join with prev line.  */
-                while (lines[cur_row].len > 0 &&
-                       cur_col > 0 &&
-                       lines[cur_row].buf[0] == ' ') {
+                /* Between col 0 and left_tab: delete a single leading
+                 * space (if present) then fall through to join with
+                 * the previous line if needed. Backspace should only
+                 * move the cursor by one cell regardless of position. */
+                if (lines[cur_row].len > 0 && lines[cur_row].buf[0] == ' ') {
                     line_del(&lines[cur_row], 0);
                     cur_col--;
                 }
@@ -4033,6 +4121,15 @@ static void handle_key(int ch)
                     reflow_paragraph();
                 }
             }
+        }
+        /* Enforce single-step cursor movement: restore to one position
+         * left of the original offset we recorded before mutation. */
+        {
+            int target = old_off - 1;
+            set_pos_from_doc_offset(target);
+            mark_visible_dirty();
+            content_dirty = 1;
+            status_dirty = 1;
         }
         break;
 
