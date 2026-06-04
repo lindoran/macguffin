@@ -137,6 +137,7 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 | Tab              | Insert current tab size spaces                  |
 | Insert           | Toggle INS / OVR                                |
 | Arrows           | Move cursor (clears defined mark)               |
+| Shift+Arrows     | Select text — region highlights as you extend; releasing Shift closes the selection |
 | Home / End       | Left tab / end of line                          |
 | PgUp / PgDn      | Scroll a screenful                              |
 | Enter            | Split line (kills mark if defined)              |
@@ -151,9 +152,15 @@ Macguffin uses a **mark and kill** model for region operations. This fits the fi
 
 ### Defining a region
 
-Press **Ctrl+K** to drop an anchor at the cursor. The status bar shows `[^K] second mark  [ESC] cancel`. Navigate freely with plain arrows — the mark stays active. Press **Ctrl+K** again to close the region; the status bar changes to `[F1] kill  [ESC] cancel`. The marked region is shown inverted on screen. **ESC** cancels at any point without killing.
+There are two ways to define a region.
 
-Plain arrows clear a defined mark and move normally. Typing a character also clears the mark.
+**Shift+arrow** is the fastest path. Hold Shift and press any arrow key — an anchor drops at the current position and the selection highlights immediately as you move. Each additional Shift+arrow extends the region. Releasing Shift closes it; the kill/copy prompt appears in the status bar and the region stays highlighted.
+
+**Ctrl+K** is the keyboard-only path. Press **Ctrl+K** to drop an anchor. Navigate freely with plain arrows — the mark stays active and the selected region is shown inverted. Press **Ctrl+K** again to close the region and show the kill/copy prompt. **ESC** cancels at any point without killing.
+
+The two methods are interchangeable: you can start with Shift+arrow and finish with Ctrl+K, or vice versa.
+
+Plain arrows clear a closed selection and move normally. Typing a character also clears the mark.
 
 ### Clipboard (Ctrl-C, Ctrl-X, Ctrl-V)
 

@@ -753,7 +753,8 @@ static void mark_region_bounds(int *sr, int *sc, int *er, int *ec)
 static int mark_cell_selected(int lr, int c)
 {
     int sr, sc, er, ec;
-    if (mark_state.mode != MARK_DEFINED) return 0;
+    if (mark_state.mode != MARK_DEFINED &&
+        mark_state.mode != MARK_CTRL_K) return 0;
     mark_region_bounds(&sr, &sc, &er, &ec);
     if (lr < sr || lr > er) return 0;
     if (lr == sr && c < sc) return 0;
@@ -797,6 +798,50 @@ static void ovr_blank_range(int row, int start, int len)
         l->fmt[i] = 0;
     }
     line_dirty[row] = 1;
+}
+
+/*
+ * Apply a formatting toggle to all characters in the current region.
+ *
+ * Toggle semantics: if ANY character in the region already has the bit
+ * set, clear it from all; otherwise set it on all.  This means the first
+ * press always makes the region uniformly formatted, and the second press
+ * removes it — consistent with how bold/italic work in other editors.
+ */
+static void command_format_region(int fmt_bit)
+{
+    int sr, sc, er, ec, r, c;
+    int any_set = 0;
+
+    if (mark_state.mode != MARK_DEFINED &&
+        mark_state.mode != MARK_CTRL_K) return;
+    mark_region_bounds(&sr, &sc, &er, &ec);
+
+    /* First pass: check whether any char already has the bit          */
+    for (r = sr; r <= er; r++) {
+        int col_start = (r == sr) ? sc : 0;
+        int col_end   = (r == er) ? ec : lines[r].len - 1;
+        for (c = col_start; c <= col_end && c < lines[r].len; c++) {
+            if (lines[r].fmt[c] & fmt_bit) { any_set = 1; break; }
+        }
+        if (any_set) break;
+    }
+
+    /* Second pass: set or clear accordingly                           */
+    for (r = sr; r <= er; r++) {
+        int col_start = (r == sr) ? sc : 0;
+        int col_end   = (r == er) ? ec : lines[r].len - 1;
+        for (c = col_start; c <= col_end && c < lines[r].len; c++) {
+            if (any_set)
+                lines[r].fmt[c] &= (unsigned char)~fmt_bit;
+            else
+                lines[r].fmt[c] |= (unsigned char)fmt_bit;
+        }
+        line_dirty[r] = 1;
+    }
+
+    content_dirty = 1;
+    modified      = 1;
 }
 
 /* Kill the defined marked region into the undelete slot.             */
@@ -3470,17 +3515,26 @@ static void handle_key(int ch)
     }
 
     case KEY_CTRL('b'):
-        cur_fmt ^= FMT_BOLD;
+        if (mark_state.mode == MARK_DEFINED || mark_state.mode == MARK_CTRL_K)
+            command_format_region(FMT_BOLD);
+        else
+            cur_fmt ^= FMT_BOLD;
         status_dirty = 1;
         break;
 
-    case KEY_CTRL('l'):
-        cur_fmt ^= FMT_ITALIC;
+    case KEY_CTRL('i'):
+        if (mark_state.mode == MARK_DEFINED || mark_state.mode == MARK_CTRL_K)
+            command_format_region(FMT_ITALIC);
+        else
+            cur_fmt ^= FMT_ITALIC;
         status_dirty = 1;
         break;
 
     case KEY_CTRL('u'):
-        cur_fmt ^= FMT_UNDERLINE;
+        if (mark_state.mode == MARK_DEFINED || mark_state.mode == MARK_CTRL_K)
+            command_format_region(FMT_UNDERLINE);
+        else
+            cur_fmt ^= FMT_UNDERLINE;
         status_dirty = 1;
         break;
 

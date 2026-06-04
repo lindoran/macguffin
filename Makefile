@@ -22,8 +22,10 @@ editor.o: editor.c $(VGADIR)/vgaterm.h $(VGADIR)/vio.h
 vgaterm.o: $(VGADIR)/vgaterm.c $(VGADIR)/vgaterm.h $(VGADIR)/font_vga.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# -DVIO_FREE_CTRL_KEYS frees Ctrl+I/M/[ from Tab/Return/Escape so
+# applications can bind them independently (macguffin uses Ctrl+I for italic)
 vio.o: $(VGADIR)/vio.c $(VGADIR)/vio.h $(VGADIR)/vgaterm.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -DVIO_FREE_CTRL_KEYS -c -o $@ $<
 
 $(VGADIR)/font_vga.h:
 	$(MAKE) -C $(VGADIR) font_vga.h
