@@ -2502,11 +2502,25 @@ static void justify_current_word(void)
 {
     Line *l = &lines[cur_row];
     int start, end, word_len, anchor_col, anchor_index;
-    int leading, new_len, make_break = 0;
+    int leading, make_break = 0;
     char *word;
+    int sel_sr, sel_sc, sel_er, sel_ec;
+    int use_selection = 0;
 
-    if (!find_cursor_word(&start, &end))
-        return;
+    /* If a region is selected on this same line, use the whole selection */
+    if (mark_state.mode == MARK_DEFINED || mark_state.mode == MARK_CTRL_K) {
+        mark_region_bounds(&sel_sr, &sel_sc, &sel_er, &sel_ec);
+        if (sel_sr == sel_er && sel_sr == cur_row) {
+            start = sel_sc;
+            end = sel_ec;
+            use_selection = 1;
+        }
+    }
+
+    if (!use_selection) {
+        if (!find_cursor_word(&start, &end))
+            return;
+    }
 
     word_len = end - start + 1;
     if (end < tabs.center_tab) {
@@ -2530,34 +2544,73 @@ static void justify_current_word(void)
         return;
 
     word = (char *)malloc((size_t)word_len);
-    if (!word)
+    unsigned char *word_fmt = (unsigned char *)malloc((size_t)word_len);
+    if (!word || !word_fmt) {
+        free(word);
+        free(word_fmt);
         return;
+    }
     memcpy(word, l->buf + start, (size_t)word_len);
+    memcpy(word_fmt, l->fmt + start, (size_t)word_len);
 
-    new_len = leading + word_len;
-    line_grow(l, new_len);
-    if (leading > start)
-        memset(l->buf + start, ' ', (size_t)(leading - start));
-    memcpy(l->buf + leading, word, (size_t)word_len);
-    l->buf[new_len] = '\0';
-    l->len = new_len;
-    line_truncate(l, new_len);
+    /* Only support moving right (keeping simple semantics) */
+    if (leading < start) {
+        free(word);
+        free(word_fmt);
+        return;
+    }
+
+    {
+        int old_len = l->len;
+        int tail_start = end + 1;
+        int tail_len = (tail_start < old_len) ? (old_len - tail_start) : 0;
+        int total_new_len = leading + word_len + tail_len;
+
+        line_grow(l, total_new_len);
+
+        /* Move trailing text (if any) to its new position */
+        if (tail_len > 0) {
+            memmove(l->buf + (leading + word_len), l->buf + tail_start, (size_t)tail_len);
+            memmove(l->fmt + (leading + word_len), l->fmt + tail_start, (size_t)tail_len);
+        }
+
+        /* Fill intervening space between original start and new leading */
+        if (leading > start) {
+            memset(l->buf + start, ' ', (size_t)(leading - start));
+            memset(l->fmt + start, 0, (size_t)(leading - start));
+        }
+
+        /* Copy word and its formatting into place */
+        memcpy(l->buf + leading, word, (size_t)word_len);
+        memcpy(l->fmt + leading, word_fmt, (size_t)word_len);
+
+        l->len = total_new_len;
+        l->buf[total_new_len] = '\0';
+        l->fmt[total_new_len] = 0;
+    }
+
     free(word);
+    free(word_fmt);
 
-    cur_col = new_len;
+    /* Position cursor after the moved word/selection */
+    cur_col = leading + word_len;
+    if (cur_col > l->len) cur_col = l->len;
+    /* Clear any selection and refresh highlight */
+    mark_state.mode = MARK_NONE;
+    mark_visible_dirty();
     modified = 1;
     line_dirty[cur_row] = 1;
     content_dirty = 1;
     status_dirty = 1;
 
     if (make_break && nlines < MAX_LINES) {
+        /* Insert a soft-break after the current line but keep cursor
+         * positioned after the word on the same line. */
         split_line(cur_row, l->len, 1);
-        cur_row++;
         reserve_page_footer_if_needed();
-    reserve_page_header_if_needed();
-        prefix_line_spaces(&lines[cur_row], tabs.left_tab);
-        cur_col = tabs.left_tab;
-        line_dirty[cur_row] = 1;
+        reserve_page_header_if_needed();
+        prefix_line_spaces(&lines[cur_row + 1], tabs.left_tab);
+        line_dirty[cur_row + 1] = 1;
         ensure_visible();
     }
 }
