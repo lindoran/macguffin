@@ -92,7 +92,7 @@ Macguffin supports three character-level formatting attributes: **Bold**, *Itali
 | Attribute | Key    | Screen rendering            | PCL3 output          |
 |-----------|--------|-----------------------------|----------------------|
 | Bold      | Ctrl-B | Bright foreground intensity | Stroke weight +3     |
-| Italic    | Ctrl-L | Alternate italic font slot  | Posture: italic      |
+| Italic    | Ctrl-I | Alternate italic font slot  | Posture: italic      |
 | Underline | Ctrl-U | Pixel underline on row 14   | PCL underline mode   |
 
 All eight combinations (B × I × U) work simultaneously. The current active attributes are shown in the status bar:
@@ -105,9 +105,9 @@ All eight combinations (B × I × U) work simultaneously. The current active att
     └────── Bold active / inactive
 ```
 
-Formatting is stored in the `.mgf` project file alongside the text. Plain-text `.txt` export strips all formatting. PCL3 export emits the appropriate escape sequences so formatting prints correctly on HP DeskJet and compatible printers.
+When a region is selected, Ctrl-B / Ctrl-I / Ctrl-U apply the attribute to every character in the selection rather than toggling the insertion state. If any character in the region already has the attribute, it is cleared from all; otherwise it is set on all.
 
-> **Note:** Ctrl-L is used for italic because Ctrl-I is ASCII 9 (Tab) and cannot be distinguished from it at this level.
+Formatting is stored in the `.mgf` project file alongside the text. Plain-text `.txt` export strips all formatting. PCL3 export emits the appropriate escape sequences so formatting prints correctly on HP DeskJet and compatible printers.
 
 ## Keybindings
 
@@ -117,7 +117,7 @@ Formatting is stored in the `.mgf` project file alongside the text. Plain-text `
 | Ctrl-N           | New file                                        |
 | Ctrl-Q           | Quit                                            |
 | Ctrl-B           | Toggle **Bold**                                 |
-| Ctrl-L           | Toggle *Italic*                                 |
+| Ctrl-I           | Toggle *Italic*                                 |
 | Ctrl-U           | Toggle Underline                                |
 | Ctrl-J           | Justify word under cursor                       |
 | Ctrl-T           | Move current line to page header slot           |

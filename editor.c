@@ -807,6 +807,10 @@ static void ovr_blank_range(int row, int start, int len)
  * set, clear it from all; otherwise set it on all.  This means the first
  * press always makes the region uniformly formatted, and the second press
  * removes it — consistent with how bold/italic work in other editors.
+ *
+ * Uses mark_cell_selected() as the single source of truth for whether a
+ * cell is in the region — same logic as the highlight renderer, so what
+ * you see highlighted is exactly what gets formatted.
  */
 static void command_format_region(int fmt_bit)
 {
@@ -817,27 +821,29 @@ static void command_format_region(int fmt_bit)
         mark_state.mode != MARK_CTRL_K) return;
     mark_region_bounds(&sr, &sc, &er, &ec);
 
-    /* First pass: check whether any char already has the bit          */
+    /* First pass: check whether any highlighted char already has the bit */
     for (r = sr; r <= er; r++) {
-        int col_start = (r == sr) ? sc : 0;
-        int col_end   = (r == er) ? ec : lines[r].len - 1;
-        for (c = col_start; c <= col_end && c < lines[r].len; c++) {
-            if (lines[r].fmt[c] & fmt_bit) { any_set = 1; break; }
+        for (c = 0; c < lines[r].len; c++) {
+            if (mark_cell_selected(r, c) && (lines[r].fmt[c] & fmt_bit)) {
+                any_set = 1;
+                break;
+            }
         }
         if (any_set) break;
     }
 
-    /* Second pass: set or clear accordingly                           */
+    /* Second pass: set or clear every highlighted char accordingly       */
     for (r = sr; r <= er; r++) {
-        int col_start = (r == sr) ? sc : 0;
-        int col_end   = (r == er) ? ec : lines[r].len - 1;
-        for (c = col_start; c <= col_end && c < lines[r].len; c++) {
+        int changed = 0;
+        for (c = 0; c < lines[r].len; c++) {
+            if (!mark_cell_selected(r, c)) continue;
             if (any_set)
                 lines[r].fmt[c] &= (unsigned char)~fmt_bit;
             else
                 lines[r].fmt[c] |= (unsigned char)fmt_bit;
+            changed = 1;
         }
-        line_dirty[r] = 1;
+        if (changed) line_dirty[r] = 1;
     }
 
     content_dirty = 1;
